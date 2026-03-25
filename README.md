@@ -77,13 +77,24 @@ sudo systemctl status pass-collector
 
 ### 2) Mount behind nginx at /pass-collector/
 
-Copy the snippet and include it in your HTTPS server block:
+The provided file is a **location snippet**, not a standalone server block.
+Do **not** place it in `/etc/nginx/conf.d/` — that directory is auto-loaded
+at the `http {}` level where `location` directives are invalid.
 
-```nginx
-include /etc/nginx/conf.d/pass-collector.nginx.conf;
+Instead:
+
+```bash
+# Copy to the snippets directory (not auto-loaded)
+sudo cp /opt/pass-collector/pass-collector.nginx.conf /etc/nginx/snippets/pass-collector.nginx.conf
 ```
 
-Then validate and reload nginx:
+Then add this line **inside** the `server {}` block of your existing HTTPS nginx config:
+
+```nginx
+include /etc/nginx/snippets/pass-collector.nginx.conf;
+```
+
+Validate and reload:
 
 ```bash
 sudo nginx -t
