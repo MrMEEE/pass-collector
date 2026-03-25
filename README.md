@@ -56,3 +56,36 @@ curl -X POST "http://localhost:8000/" \
 - Query strings are usually logged by proxies and browsers, so GET with secrets is not secure for production.
 - Prefer POST for sending secrets.
 - This is intentionally minimal for local/simple usage.
+
+## Deploy on RHEL9 (systemd + nginx)
+
+Default install layout:
+
+- `/opt/pass-collector/app.py`
+- `/opt/pass-collector/.venv/`
+
+### 1) Install systemd service
+
+```bash
+sudo useradd --system --home /opt/pass-collector --shell /sbin/nologin passcollector
+sudo cp /opt/pass-collector/pass-collector.service /etc/systemd/system/pass-collector.service
+sudo chown -R passcollector:passcollector /opt/pass-collector
+sudo systemctl daemon-reload
+sudo systemctl enable --now pass-collector
+sudo systemctl status pass-collector
+```
+
+### 2) Mount behind nginx at /pass-collector/
+
+Copy the snippet and include it in your HTTPS server block:
+
+```nginx
+include /etc/nginx/conf.d/pass-collector.nginx.conf;
+```
+
+Then validate and reload nginx:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
