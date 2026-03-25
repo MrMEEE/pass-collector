@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from flask import Flask, jsonify, request
 
@@ -68,7 +68,7 @@ def parse_request_values() -> tuple[Any, Any, Any]:
 
 
 @app.route("/", methods=["GET", "POST"])
-def store_password() -> tuple[Any, int] | Any:
+def store_password() -> Union[tuple[Any, int], Any]:
     client, secret, cred_type = parse_request_values()
 
     missing = [
