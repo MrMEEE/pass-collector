@@ -117,6 +117,15 @@ Show current stored configuration:
 
 Use [pass-collector-config](pass-collector-config) to invite/create a service user without saving the admin token.
 
+Interactive mode is available when running with minimal arguments:
+
+```bash
+./pass-collector-config service-user
+```
+
+It will prompt for base URL, email, optional org UUID/role, and the admin token.
+In guided mode it asks if you want to set org membership now, instead of always asking for org UUID.
+
 Example:
 
 ```bash

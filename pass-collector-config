@@ -3,6 +3,7 @@ import argparse
 import getpass
 import json
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, quote_plus
@@ -259,6 +260,41 @@ def _resolve_setting(args: argparse.Namespace, db_path: Path, arg_name: str, con
     return value
 
 
+def _prompt_value(prompt: str, default: Optional[str] = None, required: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default else ""
+        value = input(f"{prompt}{suffix}: ").strip()
+        if not value and default is not None:
+            value = default
+        if value or not required:
+            return value
+        print("Value is required.")
+
+
+def _prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    default_hint = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{prompt} [{default_hint}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def _prompt_choice(prompt: str, choices: list[str], default: str) -> str:
+    allowed = "/".join(choices)
+    while True:
+        raw = input(f"{prompt} [{default}] ({allowed}): ").strip()
+        if not raw:
+            return default
+        if raw in choices:
+            return raw
+        print(f"Please choose one of: {allowed}")
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     _ensure_vw_map_table(db_path)
@@ -400,33 +436,65 @@ def set_membership_type(
 
 def cmd_service_user(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
-    base_url = (_resolve_setting(args, db_path, "base_url", "VW_API_URL", required=True) or "").rstrip("/")
+    interactive_mode = all(
+        [
+            not args.base_url,
+            not args.email,
+            not args.org_uuid,
+            "--org-role" not in sys.argv,
+        ]
+    )
+
+    base_url_default = _resolve_setting(args, db_path, "base_url", "VW_API_URL")
+
+    base_url = (args.base_url or "").strip()
+    if not base_url:
+        base_url = _prompt_value("Vaultwarden base URL", default=base_url_default, required=True)
+    base_url = base_url.rstrip("/")
+
+    email = (args.email or "").strip()
+    if not email:
+        email = _prompt_value("Service user email", required=True)
+
+    org_uuid = (args.org_uuid or "").strip()
+    if not org_uuid:
+        if interactive_mode and _prompt_yes_no("Set organization membership role now?", default=False):
+            org_uuid = _prompt_value("Organization UUID", required=True)
+        elif not interactive_mode:
+            org_uuid = _prompt_value("Organization UUID (optional)", required=False)
+    org_uuid = org_uuid or None
+
+    org_role = args.org_role
+    if org_uuid and "--org-role" not in sys.argv:
+        role_prompt = "Organization role (0=Owner, 1=Admin, 2=User, 3=Manager)"
+        org_role = _prompt_choice(role_prompt, ["0", "1", "2", "3"], default=org_role)
+
     admin_token = args.admin_token or getpass.getpass("Vaultwarden ADMIN_TOKEN: ")
 
     session = requests.Session()
 
     admin_login(session, base_url, admin_token)
-    invite_result = invite_user(session, base_url, args.email)
+    invite_result = invite_user(session, base_url, email)
 
     if invite_result.get("already_exists"):
-        print(f"User already exists: {args.email}")
+        print(f"User already exists: {email}")
     else:
-        print(f"Invited/created user: {args.email}")
+        print(f"Invited/created user: {email}")
 
-    if args.org_uuid:
-        user_data = get_user_by_mail(session, base_url, args.email)
+    if org_uuid:
+        user_data = get_user_by_mail(session, base_url, email)
         user_id = user_data["id"]
         try:
             set_membership_type(
                 session=session,
                 base_url=base_url,
                 user_uuid=user_id,
-                org_uuid=args.org_uuid,
-                user_type=args.org_role,
+                org_uuid=org_uuid,
+                user_type=org_role,
             )
             print(
                 "Updated org role successfully "
-                f"(org={args.org_uuid}, user={user_id}, role={args.org_role})."
+                f"(org={org_uuid}, user={user_id}, role={org_role})."
             )
         except RuntimeError as exc:
             print("Could not set org role automatically.")
@@ -498,7 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_user = sub.add_parser("service-user", help="Invite/create Vaultwarden service user")
     service_user.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")
     service_user.add_argument("--base-url", default=None, help="Vaultwarden base URL (falls back to DB config VW_API_URL)")
-    service_user.add_argument("--email", required=True, help="Service user email")
+    service_user.add_argument("--email", default=None, help="Service user email")
     service_user.add_argument("--admin-token", default=None, help="Vaultwarden ADMIN_TOKEN (optional prompt)")
     service_user.add_argument("--org-uuid", default=None, help="Optional organization UUID")
     service_user.add_argument("--org-role", default="2", choices=["0", "1", "2", "3"], help="0=Owner,1=Admin,2=User,3=Manager")
