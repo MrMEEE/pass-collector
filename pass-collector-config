@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import getpass
+import html
 import json
 import re
 import sqlite3
@@ -370,21 +371,33 @@ def _extract_orgs_from_html(html: str) -> list[dict[str, str]]:
 
     # Secondary: look for delete-form action URLs which contain org UUIDs,
     # then try to pair with the preceding table-cell text (org name).
-    row_re = re.compile(
-        r'<tr[^>]*>(.*?)</tr>',
-        re.DOTALL | re.IGNORECASE,
-    )
+    row_re = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
     uuid_re = re.compile(_UUID_RE.pattern, re.IGNORECASE)
-    td_text_re = re.compile(r'<td[^>]*>\s*([^<\s][^<]*?)\s*</td>', re.IGNORECASE)
+    td_inner_re = re.compile(r'<td[^>]*>(.*?)</td>', re.DOTALL | re.IGNORECASE)
+
+    def _clean_html_text(fragment: str) -> str:
+        # Remove tags and normalize whitespace so anchor-wrapped org names are captured.
+        no_tags = re.sub(r"<[^>]+>", " ", fragment)
+        return re.sub(r"\s+", " ", html.unescape(no_tags)).strip()
 
     for row_match in row_re.finditer(html):
         row_html = row_match.group(1)
         uuids_in_row = uuid_re.findall(row_html)
         if not uuids_in_row:
             continue
-        texts = td_text_re.findall(row_html)
+        td_cells = td_inner_re.findall(row_html)
+        texts = [_clean_html_text(cell) for cell in td_cells]
         # First non-UUID text cell is likely the org name
-        name = next((t.strip() for t in texts if not uuid_re.fullmatch(t.strip())), "")
+        name = next(
+            (
+                t
+                for t in texts
+                if t
+                and not uuid_re.fullmatch(t)
+                and t.lower() not in ("delete", "remove")
+            ),
+            "",
+        )
         uid = uuids_in_row[0].lower()
         if uid not in seen:
             seen.add(uid)
