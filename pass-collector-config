@@ -477,6 +477,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             changed += 1
 
     if changed == 0:
+        # Friendly UX: with no config flags, show subcommand help instead of traceback.
+        parser = getattr(args, "_subparser", None)
+        if parser is not None:
+            parser.print_help()
+            return 0
         raise RuntimeError("No configuration values provided. Use --show, --set KEY=VALUE, or explicit flags.")
 
     print(f"Saved {changed} configuration value(s) to {db_path}")
@@ -524,6 +529,7 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--name-template", default=None)
     config.add_argument("--username-template", default=None)
     config.add_argument("--notes-template", default=None)
+    config.set_defaults(_subparser=config)
     config.set_defaults(func=cmd_config)
 
     return parser
