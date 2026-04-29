@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import urllib3
 from pathlib import Path
 from typing import Any, Optional, Union
 from urllib.parse import quote_plus
@@ -232,6 +233,10 @@ class VaultwardenBackend(CredentialBackend):
                 "Content-Type": "application/json",
             }
         )
+        verify_ssl_raw = (cfg("VW_VERIFY_SSL", "true") or "true").lower()
+        self.session.verify = verify_ssl_raw not in ("false", "0", "no")
+        if not self.session.verify:
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
         url = f"{self.base_url}{path}"

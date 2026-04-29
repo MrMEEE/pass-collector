@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote, quote_plus
 
+import urllib3
+
 import requests
 
 DEFAULT_DB_PATH = Path(__file__).with_name("data.db")
@@ -16,6 +18,7 @@ CONFIG_KEYS = [
     "VW_API_URL",
     "VW_ACCESS_TOKEN",
     "VW_ORGANIZATION_ID",
+    "VW_VERIFY_SSL",
     "VW_CLIENT_MAP_JSON",
     "VW_TYPE_MAP_JSON",
     "VW_NAME_TEMPLATE",
@@ -237,7 +240,7 @@ def _extract_cipher_id(payload: Any) -> str:
     raise RuntimeError("Vaultwarden create response did not include cipher id")
 
 
-def _create_session(vw_api_url: str, vw_access_token: str) -> requests.Session:
+def _create_session(vw_api_url: str, vw_access_token: str, verify_ssl: bool = True) -> requests.Session:
     s = requests.Session()
     s.headers.update(
         {
@@ -245,6 +248,9 @@ def _create_session(vw_api_url: str, vw_access_token: str) -> requests.Session:
             "Content-Type": "application/json",
         }
     )
+    s.verify = verify_ssl
+    if not verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return s
 
 
@@ -364,6 +370,8 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL", required=True)
     vw_access_token = _resolve_setting(args, db_path, "vw_access_token", "VW_ACCESS_TOKEN", required=True)
     vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
+    verify_ssl_cfg = _get_config_value(db_path, "VW_VERIFY_SSL")
+    verify_ssl = not args.no_verify_ssl and (verify_ssl_cfg or "").lower() not in ("false", "0", "no")
 
     client_map_json = _resolve_setting(args, db_path, "client_map_json", "VW_CLIENT_MAP_JSON")
     type_map_json = _resolve_setting(args, db_path, "type_map_json", "VW_TYPE_MAP_JSON")
@@ -374,7 +382,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     client_map = _load_json_map(client_map_json, "VW_CLIENT_MAP_JSON")
     type_map = _load_json_map(type_map_json, "VW_TYPE_MAP_JSON")
 
-    session = _create_session(vw_api_url.rstrip("/"), vw_access_token)
+    session = _create_session(vw_api_url.rstrip("/"), vw_access_token, verify_ssl=verify_ssl)
     entries = _read_credentials(db_path)
 
     migrated = 0
@@ -520,7 +528,13 @@ def cmd_service_user(args: argparse.Namespace) -> int:
 
     admin_token = args.admin_token or getpass.getpass("Vaultwarden ADMIN_TOKEN: ")
 
+    verify_ssl_cfg = _get_config_value(db_path, "VW_VERIFY_SSL")
+    verify_ssl = not args.no_verify_ssl and (verify_ssl_cfg or "").lower() not in ("false", "0", "no")
+
     session = requests.Session()
+    session.verify = verify_ssl
+    if not verify_ssl:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     admin_login(session, base_url, admin_token)
 
@@ -599,6 +613,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "vw_api_url": "VW_API_URL",
         "vw_access_token": "VW_ACCESS_TOKEN",
         "vw_organization_id": "VW_ORGANIZATION_ID",
+        "vw_verify_ssl": "VW_VERIFY_SSL",
         "client_map_json": "VW_CLIENT_MAP_JSON",
         "type_map_json": "VW_TYPE_MAP_JSON",
         "name_template": "VW_NAME_TEMPLATE",
@@ -638,6 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
     service_user.add_argument("--admin-token", default=None, help="Vaultwarden ADMIN_TOKEN (optional prompt)")
     service_user.add_argument("--org-uuid", default=None, help="Optional organization UUID")
     service_user.add_argument("--org-role", default="2", choices=["0", "1", "2", "3"], help="0=Owner,1=Admin,2=User,3=Manager")
+    service_user.add_argument("--no-verify-ssl", action="store_true", default=False, help="Disable SSL certificate verification (accept self-signed certs)")
     service_user.set_defaults(func=cmd_service_user)
 
     migrate = sub.add_parser("migrate", help="Migrate SQLite credentials to Vaultwarden")
@@ -650,6 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--name-template", default=None, help="Vaultwarden item name template")
     migrate.add_argument("--username-template", default=None, help="Vaultwarden username template")
     migrate.add_argument("--notes-template", default=None, help="Vaultwarden notes template")
+    migrate.add_argument("--no-verify-ssl", action="store_true", default=False, help="Disable SSL certificate verification (accept self-signed certs)")
     migrate.set_defaults(func=cmd_migrate)
 
     config = sub.add_parser("config", help="Read/write pass-collector config stored in SQLite")
@@ -665,6 +682,7 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--name-template", default=None)
     config.add_argument("--username-template", default=None)
     config.add_argument("--notes-template", default=None)
+    config.add_argument("--vw-verify-ssl", choices=["true", "false"], default=None, help="Set to 'false' to accept self-signed SSL certificates")
     config.set_defaults(_subparser=config)
     config.set_defaults(func=cmd_config)
 
