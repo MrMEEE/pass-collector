@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+import argparse
+import getpass
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import quote, quote_plus
+
+import requests
+
+DEFAULT_DB_PATH = Path(__file__).with_name("data.db")
+CONFIG_KEYS = [
+    "BACKEND",
+    "VW_API_URL",
+    "VW_ACCESS_TOKEN",
+    "VW_ORGANIZATION_ID",
+    "VW_CLIENT_MAP_JSON",
+    "VW_TYPE_MAP_JSON",
+    "VW_NAME_TEMPLATE",
+    "VW_USERNAME_TEMPLATE",
+    "VW_NOTES_TEMPLATE",
+]
+
+
+def _raise_for_http(response: requests.Response, context: str) -> None:
+    if response.status_code >= 400:
+        body = response.text.strip()
+        raise RuntimeError(f"{context} failed ({response.status_code}): {body}")
+
+
+def _load_json_map(raw: Optional[str], name: str) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} must be valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"{name} must be a JSON object")
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+def _read_credentials(db_path: Path) -> list[dict[str, str]]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT client, cred_type, secret
+            FROM credentials
+            ORDER BY client, cred_type
+            """
+        ).fetchall()
+        return [
+            {
+                "client": row["client"],
+                "type": row["cred_type"],
+                "secret": row["secret"],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def _ensure_vw_map_table(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vaultwarden_item_map (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client TEXT NOT NULL,
+                cred_type TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(client, cred_type)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _ensure_app_config_table(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_config_value(db_path: Path, key: str, value: str) -> None:
+    _ensure_app_config_table(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO app_config (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET
+                value = excluded.value,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_config_value(db_path: Path, key: str) -> Optional[str]:
+    _ensure_app_config_table(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT value FROM app_config WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def _list_config(db_path: Path) -> dict[str, str]:
+    _ensure_app_config_table(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT key, value FROM app_config ORDER BY key").fetchall()
+        return {row["key"]: row["value"] for row in rows}
+    finally:
+        conn.close()
+
+
+def _get_mapped_item_id(db_path: Path, client: str, cred_type: str) -> Optional[str]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            """
+            SELECT item_id FROM vaultwarden_item_map
+            WHERE client = ? AND cred_type = ?
+            """,
+            (client, cred_type),
+        ).fetchone()
+        return row["item_id"] if row else None
+    finally:
+        conn.close()
+
+
+def _upsert_mapped_item_id(db_path: Path, client: str, cred_type: str, item_id: str) -> None:
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO vaultwarden_item_map (client, cred_type, item_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(client, cred_type)
+            DO UPDATE SET
+                item_id = excluded.item_id,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (client, cred_type, item_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_payload(
+    client: str,
+    secret: str,
+    cred_type: str,
+    org_id: Optional[str],
+    client_map: dict[str, str],
+    type_map: dict[str, str],
+    name_template: str,
+    username_template: str,
+    notes_template: str,
+) -> dict[str, Any]:
+    mapped_client = client_map.get(client, client)
+    mapped_type = type_map.get(cred_type, cred_type)
+    values = {
+        "client": mapped_client,
+        "type": mapped_type,
+        "raw_client": client,
+        "raw_type": cred_type,
+    }
+
+    payload: dict[str, Any] = {
+        "type": 1,
+        "name": name_template.format(**values),
+        "notes": notes_template.format(**values),
+        "favorite": False,
+        "login": {
+            "username": username_template.format(**values),
+            "password": secret,
+            "totp": None,
+            "uris": [],
+        },
+        "collectionIds": [],
+        "folderId": None,
+        "secureNote": None,
+        "card": None,
+        "identity": None,
+        "reprompt": 0,
+    }
+    if org_id:
+        payload["organizationId"] = org_id
+    return payload
+
+
+def _extract_cipher_id(payload: Any) -> str:
+    if isinstance(payload, dict):
+        cipher_id = payload.get("id") or payload.get("Id")
+        if cipher_id:
+            return str(cipher_id)
+
+        nested = payload.get("data") or payload.get("Data")
+        if isinstance(nested, dict):
+            cipher_id = nested.get("id") or nested.get("Id")
+            if cipher_id:
+                return str(cipher_id)
+
+    raise RuntimeError("Vaultwarden create response did not include cipher id")
+
+
+def _create_session(vw_api_url: str, vw_access_token: str) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "Authorization": f"Bearer {vw_access_token}",
+            "Content-Type": "application/json",
+        }
+    )
+    return s
+
+
+def _resolve_setting(args: argparse.Namespace, db_path: Path, arg_name: str, config_key: str, required: bool = False) -> Optional[str]:
+    value = getattr(args, arg_name)
+    if value:
+        return value
+    value = _get_config_value(db_path, config_key)
+    if required and not value:
+        raise RuntimeError(
+            f"Missing setting {config_key}. Provide --{arg_name.replace('_', '-')} or set it via 'pass-collector-config config'."
+        )
+    return value
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path)
+    _ensure_vw_map_table(db_path)
+
+    vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL", required=True)
+    vw_access_token = _resolve_setting(args, db_path, "vw_access_token", "VW_ACCESS_TOKEN", required=True)
+    vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
+
+    client_map_json = _resolve_setting(args, db_path, "client_map_json", "VW_CLIENT_MAP_JSON")
+    type_map_json = _resolve_setting(args, db_path, "type_map_json", "VW_TYPE_MAP_JSON")
+    name_template = _resolve_setting(args, db_path, "name_template", "VW_NAME_TEMPLATE") or "pass-collector:{client}:{type}"
+    username_template = _resolve_setting(args, db_path, "username_template", "VW_USERNAME_TEMPLATE") or "{client}"
+    notes_template = _resolve_setting(args, db_path, "notes_template", "VW_NOTES_TEMPLATE") or "client={client}; type={type}"
+
+    client_map = _load_json_map(client_map_json, "VW_CLIENT_MAP_JSON")
+    type_map = _load_json_map(type_map_json, "VW_TYPE_MAP_JSON")
+
+    session = _create_session(vw_api_url.rstrip("/"), vw_access_token)
+    entries = _read_credentials(db_path)
+
+    migrated = 0
+    failures: list[dict[str, str]] = []
+
+    for entry in entries:
+        client = entry["client"]
+        cred_type = entry["type"]
+        secret = entry["secret"]
+
+        try:
+            old_id = _get_mapped_item_id(db_path, client, cred_type)
+            if old_id:
+                delete_resp = session.delete(f"{vw_api_url.rstrip('/')}/api/ciphers/{quote_plus(old_id)}", timeout=20)
+                if delete_resp.status_code not in (200, 204, 404, 410):
+                    _raise_for_http(delete_resp, "Delete existing cipher")
+
+            payload = _build_payload(
+                client=client,
+                secret=secret,
+                cred_type=cred_type,
+                org_id=vw_organization_id,
+                client_map=client_map,
+                type_map=type_map,
+                name_template=name_template,
+                username_template=username_template,
+                notes_template=notes_template,
+            )
+            create_resp = session.post(f"{vw_api_url.rstrip('/')}/api/ciphers", json=payload, timeout=20)
+            _raise_for_http(create_resp, "Create cipher")
+            new_id = _extract_cipher_id(create_resp.json())
+            _upsert_mapped_item_id(db_path, client, cred_type, new_id)
+            migrated += 1
+        except Exception as exc:
+            failures.append(
+                {
+                    "client": client,
+                    "type": cred_type,
+                    "error": str(exc),
+                }
+            )
+
+    print(
+        json.dumps(
+            {
+                "ok": len(failures) == 0,
+                "total": len(entries),
+                "migrated": migrated,
+                "failed": len(failures),
+                "failures": failures,
+            },
+            indent=2,
+        )
+    )
+
+    return 0 if not failures else 2
+
+
+def admin_login(session: requests.Session, base_url: str, admin_token: str) -> None:
+    resp = session.post(
+        f"{base_url}/admin",
+        data={"token": admin_token},
+        timeout=15,
+        allow_redirects=False,
+    )
+
+    if resp.status_code not in (200, 302, 303):
+        _raise_for_http(resp, "Admin login")
+
+    if "VW_ADMIN" not in session.cookies.get_dict():
+        raise RuntimeError("Admin login did not return VW_ADMIN session cookie")
+
+
+def invite_user(session: requests.Session, base_url: str, email: str) -> dict[str, Any]:
+    resp = session.post(
+        f"{base_url}/admin/invite",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps({"email": email}),
+        timeout=15,
+    )
+
+    if resp.status_code == 409:
+        return {"already_exists": True}
+
+    _raise_for_http(resp, "Invite user")
+    return {"already_exists": False, "payload": resp.json()}
+
+
+def get_user_by_mail(session: requests.Session, base_url: str, email: str) -> dict[str, Any]:
+    quoted = quote(email, safe="")
+    resp = session.get(f"{base_url}/admin/users/by-mail/{quoted}", timeout=15)
+    _raise_for_http(resp, "Get user by mail")
+
+    data = resp.json()
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError("Unexpected response from /admin/users/by-mail/<mail>")
+    return data
+
+
+def set_membership_type(
+    session: requests.Session,
+    base_url: str,
+    user_uuid: str,
+    org_uuid: str,
+    user_type: str,
+) -> None:
+    payload = {
+        "user_type": user_type,
+        "user_uuid": user_uuid,
+        "org_uuid": org_uuid,
+    }
+
+    resp = session.post(
+        f"{base_url}/admin/users/org_type",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload),
+        timeout=15,
+    )
+    _raise_for_http(resp, "Set organization role")
+
+
+def cmd_service_user(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path)
+    base_url = (_resolve_setting(args, db_path, "base_url", "VW_API_URL", required=True) or "").rstrip("/")
+    admin_token = args.admin_token or getpass.getpass("Vaultwarden ADMIN_TOKEN: ")
+
+    session = requests.Session()
+
+    admin_login(session, base_url, admin_token)
+    invite_result = invite_user(session, base_url, args.email)
+
+    if invite_result.get("already_exists"):
+        print(f"User already exists: {args.email}")
+    else:
+        print(f"Invited/created user: {args.email}")
+
+    if args.org_uuid:
+        user_data = get_user_by_mail(session, base_url, args.email)
+        user_id = user_data["id"]
+        try:
+            set_membership_type(
+                session=session,
+                base_url=base_url,
+                user_uuid=user_id,
+                org_uuid=args.org_uuid,
+                user_type=args.org_role,
+            )
+            print(
+                "Updated org role successfully "
+                f"(org={args.org_uuid}, user={user_id}, role={args.org_role})."
+            )
+        except RuntimeError as exc:
+            print("Could not set org role automatically.")
+            print(f"Reason: {exc}")
+            print("This usually means the user is not yet a member of that organization.")
+            print("Invite the user to the org first, then rerun this command with --org-uuid.")
+
+    print("Done.")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    db_path = Path(args.db_path)
+
+    if args.show:
+        current = _list_config(db_path)
+        print(json.dumps(current, indent=2))
+        return 0
+
+    changed = 0
+
+    for pair in args.set or []:
+        if "=" not in pair:
+            raise RuntimeError(f"Invalid --set value '{pair}', expected KEY=VALUE")
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if key not in CONFIG_KEYS:
+            raise RuntimeError(f"Unsupported config key '{key}'. Allowed: {', '.join(CONFIG_KEYS)}")
+        _set_config_value(db_path, key, value)
+        changed += 1
+
+    arg_to_key = {
+        "backend": "BACKEND",
+        "vw_api_url": "VW_API_URL",
+        "vw_access_token": "VW_ACCESS_TOKEN",
+        "vw_organization_id": "VW_ORGANIZATION_ID",
+        "client_map_json": "VW_CLIENT_MAP_JSON",
+        "type_map_json": "VW_TYPE_MAP_JSON",
+        "name_template": "VW_NAME_TEMPLATE",
+        "username_template": "VW_USERNAME_TEMPLATE",
+        "notes_template": "VW_NOTES_TEMPLATE",
+    }
+
+    for arg_name, key in arg_to_key.items():
+        value = getattr(args, arg_name)
+        if value is not None:
+            _set_config_value(db_path, key, value)
+            changed += 1
+
+    if changed == 0:
+        raise RuntimeError("No configuration values provided. Use --show, --set KEY=VALUE, or explicit flags.")
+
+    print(f"Saved {changed} configuration value(s) to {db_path}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pass-collector-config",
+        description="General configuration and migration utility for pass-collector",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    service_user = sub.add_parser("service-user", help="Invite/create Vaultwarden service user")
+    service_user.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")
+    service_user.add_argument("--base-url", default=None, help="Vaultwarden base URL (falls back to DB config VW_API_URL)")
+    service_user.add_argument("--email", required=True, help="Service user email")
+    service_user.add_argument("--admin-token", default=None, help="Vaultwarden ADMIN_TOKEN (optional prompt)")
+    service_user.add_argument("--org-uuid", default=None, help="Optional organization UUID")
+    service_user.add_argument("--org-role", default="2", choices=["0", "1", "2", "3"], help="0=Owner,1=Admin,2=User,3=Manager")
+    service_user.set_defaults(func=cmd_service_user)
+
+    migrate = sub.add_parser("migrate", help="Migrate SQLite credentials to Vaultwarden")
+    migrate.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")
+    migrate.add_argument("--vw-api-url", default=None, help="Vaultwarden API base URL (defaults to DB config VW_API_URL)")
+    migrate.add_argument("--vw-access-token", default=None, help="Vaultwarden API bearer token (defaults to DB config VW_ACCESS_TOKEN)")
+    migrate.add_argument("--vw-organization-id", default=None, help="Optional organization UUID")
+    migrate.add_argument("--client-map-json", default=None, help="JSON map for client remapping")
+    migrate.add_argument("--type-map-json", default=None, help="JSON map for type remapping")
+    migrate.add_argument("--name-template", default=None, help="Vaultwarden item name template")
+    migrate.add_argument("--username-template", default=None, help="Vaultwarden username template")
+    migrate.add_argument("--notes-template", default=None, help="Vaultwarden notes template")
+    migrate.set_defaults(func=cmd_migrate)
+
+    config = sub.add_parser("config", help="Read/write pass-collector config stored in SQLite")
+    config.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")
+    config.add_argument("--show", action="store_true", help="Show current config")
+    config.add_argument("--set", action="append", default=[], help="Set a raw key/value pair as KEY=VALUE")
+    config.add_argument("--backend", choices=["sqlite", "vaultwarden"], default=None)
+    config.add_argument("--vw-api-url", default=None)
+    config.add_argument("--vw-access-token", default=None)
+    config.add_argument("--vw-organization-id", default=None)
+    config.add_argument("--client-map-json", default=None)
+    config.add_argument("--type-map-json", default=None)
+    config.add_argument("--name-template", default=None)
+    config.add_argument("--username-template", default=None)
+    config.add_argument("--notes-template", default=None)
+    config.set_defaults(func=cmd_config)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

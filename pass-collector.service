@@ -11,6 +11,8 @@ User=passcollector
 Group=passcollector
 
 Environment=PYTHONUNBUFFERED=1
+# Runtime settings are read from /opt/pass-collector/data.db (app_config table)
+# and managed with /opt/pass-collector/pass-collector-config.
 ExecStart=/opt/pass-collector/.venv/bin/python /opt/pass-collector/app.py
 
 Restart=always

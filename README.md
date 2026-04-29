@@ -9,6 +9,140 @@ Super simple Python webserver that accepts GET and POST requests with:
 It stores values in SQLite (`data.db`) and enforces uniqueness on (`client`, `type`).
 If the same combination arrives again, the existing value is overwritten.
 
+## Backend modes
+
+`pass-collector` supports two backends:
+
+- `sqlite` (default): local file `data.db` with upsert on (`client`, `type`)
+- `vaultwarden`: writes to Vaultwarden HTTP API using delete-then-create with local ID map
+
+Select backend using the config CLI (stored in `data.db`):
+
+```bash
+./pass-collector-config config --backend sqlite
+```
+
+or:
+
+```bash
+./pass-collector-config config --backend vaultwarden
+```
+
+### Vaultwarden backend setup
+
+Requirements:
+
+- Vaultwarden API base URL
+- API bearer token
+- optional organization UUID
+- local SQLite `vaultwarden_item_map` table (auto-created in `data.db`) to track cipher IDs per (`client`, `type`)
+
+Example:
+
+```bash
+./pass-collector-config config \
+	--backend vaultwarden \
+	--vw-api-url "https://vaultwarden.example.com" \
+	--vw-access-token "..." \
+	--vw-organization-id "..."
+```
+
+Update behavior in Vaultwarden (no read/search required):
+
+- look up known cipher ID in local SQLite map
+- if ID exists: try delete by ID (404 is ignored)
+- create new cipher
+- save new cipher ID in local SQLite map
+
+Important permission note:
+
+- this mode works without Vaultwarden read/list permissions
+- service account still needs create permission and delete permission for its own ciphers
+- if records are changed externally, local ID map can drift; next create still succeeds but stale items may remain
+
+### Custom mapping for client/type -> Vaultwarden fields
+
+You can customize how `client` and `type` are mapped into Vaultwarden payloads.
+
+Config keys (stored in SQLite):
+
+- `VW_CLIENT_MAP_JSON`: JSON object remapping client values
+- `VW_TYPE_MAP_JSON`: JSON object remapping type values
+- `VW_NAME_TEMPLATE`: default `pass-collector:{client}:{type}`
+- `VW_USERNAME_TEMPLATE`: default `{client}`
+- `VW_NOTES_TEMPLATE`: default `client={client}; type={type}`
+
+Template variables:
+
+- `{client}` and `{type}` are the mapped values
+- `{raw_client}` and `{raw_type}` are the original request values
+
+Example:
+
+```bash
+./pass-collector-config config \
+	--client-map-json '{"acme":"ACME-PROD"}' \
+	--type-map-json '{"ssh":"linux-root"}' \
+	--name-template 'cred:{client}:{type}' \
+	--username-template '{client}' \
+	--notes-template 'source=pass-collector; raw={raw_client}/{raw_type}'
+```
+
+### Migrate all SQLite entries to Vaultwarden
+
+Use the configuration CLI (not a service endpoint):
+
+```bash
+./pass-collector-config migrate \
+	--db-path /opt/pass-collector/data.db \
+	--vw-api-url "https://vaultwarden.example.com" \
+	--vw-access-token "..." \
+	--vw-organization-id "..." \
+	--client-map-json '{"acme":"ACME-PROD"}' \
+	--type-map-json '{"ssh":"linux-root"}' \
+	--name-template 'cred:{client}:{type}' \
+	--username-template '{client}' \
+	--notes-template 'source=pass-collector; raw={raw_client}/{raw_type}'
+```
+
+The command prints a JSON summary with total, migrated, failed, and per-entry failures.
+
+Show current stored configuration:
+
+```bash
+./pass-collector-config config --show
+```
+
+### Bootstrap service user with admin token
+
+Use [pass-collector-config](pass-collector-config) to invite/create a service user without saving the admin token.
+
+Example:
+
+```bash
+./pass-collector-config service-user \
+	--base-url "https://vaultwarden.example.com" \
+	--email "pass-collector@your-domain.local"
+```
+
+Optional: if the user is already in an organization, set org role:
+
+```bash
+./pass-collector-config service-user \
+	--base-url "https://vaultwarden.example.com" \
+	--email "pass-collector@your-domain.local" \
+	--org-uuid "<org-uuid>" \
+	--org-role 2
+```
+
+Role values: `0=Owner`, `1=Admin`, `2=User`, `3=Manager`.
+
+Notes:
+
+- Admin token is used only in memory for `/admin` login and is not stored.
+- Admin token can invite/create users, but organization membership is separate.
+- If user is not already in the target organization, role update will fail and you must invite/add them to org first.
+
 ## Run
 
 ```bash
