@@ -337,63 +337,99 @@ _UUID_RE = re.compile(
 
 
 def _extract_orgs_from_html(html: str) -> list[dict[str, str]]:
-    """Extract org UUIDs from Vaultwarden admin HTML page via href scraping."""
-    # Look for /admin/organizations/{uuid} in href attributes to find UUIDs,
-    # then try to pair each UUID with the nearest table-cell text (org name).
-    row_re = re.compile(
-        r'<tr[^>]*>\s*<td[^>]*>\s*([^<]+?)\s*</td>.*?/organizations/(' + _UUID_RE.pattern + r')',
-        re.DOTALL | re.IGNORECASE,
-    )
-    href_re = re.compile(r'/admin/organizations/(' + _UUID_RE.pattern + r')', re.IGNORECASE)
+    """Extract orgs from Vaultwarden admin organizations/overview HTML page.
 
+    Vaultwarden embeds page data as JSON inside a <script> tag, e.g.:
+        pageData = [...];
+    If that is not found, fall back to scraping UUIDs from delete-form actions.
+    """
     orgs: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    for match in row_re.finditer(html):
-        name = match.group(1).strip()
-        uid = match.group(2).lower()
+    # Primary: extract embedded JSON from <script> tags (Vaultwarden template pattern)
+    script_re = re.compile(r'<script[^>]*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
+    json_assign_re = re.compile(
+        r'(?:pageData|orgData|organizations)\s*[=:]\s*(\[.*?\])\s*[;,]?\s*(?:\n|$|var |let |const )',
+        re.DOTALL | re.IGNORECASE,
+    )
+    for script_match in script_re.finditer(html):
+        script_body = script_match.group(1)
+        for assign_match in json_assign_re.finditer(script_body):
+            try:
+                payload = json.loads(assign_match.group(1))
+                candidates = _extract_orgs_from_payload(payload)
+                for org in candidates:
+                    if org["id"] not in seen:
+                        seen.add(org["id"])
+                        orgs.append(org)
+            except Exception:
+                continue
+
+    if orgs:
+        return orgs
+
+    # Secondary: look for delete-form action URLs which contain org UUIDs,
+    # then try to pair with the preceding table-cell text (org name).
+    row_re = re.compile(
+        r'<tr[^>]*>(.*?)</tr>',
+        re.DOTALL | re.IGNORECASE,
+    )
+    uuid_re = re.compile(_UUID_RE.pattern, re.IGNORECASE)
+    td_text_re = re.compile(r'<td[^>]*>\s*([^<\s][^<]*?)\s*</td>', re.IGNORECASE)
+
+    for row_match in row_re.finditer(html):
+        row_html = row_match.group(1)
+        uuids_in_row = uuid_re.findall(row_html)
+        if not uuids_in_row:
+            continue
+        texts = td_text_re.findall(row_html)
+        # First non-UUID text cell is likely the org name
+        name = next((t.strip() for t in texts if not uuid_re.fullmatch(t.strip())), "")
+        uid = uuids_in_row[0].lower()
         if uid not in seen:
             seen.add(uid)
-            orgs.append({"id": uid, "name": name})
-
-    # Fallback: if row parsing found nothing, collect bare UUIDs from hrefs
-    if not orgs:
-        for match in href_re.finditer(html):
-            uid = match.group(1).lower()
-            if uid not in seen:
-                seen.add(uid)
-                orgs.append({"id": uid, "name": uid})
+            orgs.append({"id": uid, "name": name or uid})
 
     return orgs
 
 
 def list_organizations(session: requests.Session, base_url: str) -> list[dict[str, str]]:
-    # Try JSON endpoint first (works when session has user Bearer token)
-    for endpoint in [f"{base_url}/api/organizations"]:
+    # The correct Vaultwarden admin endpoint is /admin/organizations/overview (HTML only).
+    # There is no JSON org-listing endpoint in the admin API.
+    # We also try /admin/users which returns JSON and may contain org membership data.
+
+    # Try scraping the organizations overview page (HTML with embedded JSON)
+    for endpoint in [
+        f"{base_url}/admin/organizations/overview",
+        f"{base_url}/admin/organizations",   # older versions
+    ]:
         try:
             resp = session.get(endpoint, timeout=15)
             if resp.status_code >= 400:
                 continue
-            payload = resp.json()
+            # If the response is JSON, parse directly
+            ct = resp.headers.get("Content-Type", "")
+            if "json" in ct:
+                orgs = _extract_orgs_from_payload(resp.json())
+            else:
+                orgs = _extract_orgs_from_html(resp.text)
+            if orgs:
+                return orgs
         except Exception:
             continue
 
-        orgs = _extract_orgs_from_payload(payload)
-        if orgs:
-            return orgs
-
-    # Fall back to HTML scraping of the admin panel organizations page
+    # Last resort: query /admin/users (returns JSON) and extract unique org UUIDs
+    # from memberships embedded in user records.
     try:
-        resp = session.get(f"{base_url}/admin/organizations", timeout=15)
+        resp = session.get(f"{base_url}/admin/users", timeout=15)
         if resp.status_code < 400:
-            orgs = _extract_orgs_from_html(resp.text)
+            orgs = _extract_orgs_from_payload(resp.json())
             if orgs:
                 return orgs
     except Exception:
         pass
 
     raise RuntimeError("Could not list organizations from Vaultwarden admin/API endpoints")
-
 
 def _prompt_select_organization(orgs: list[dict[str, str]]) -> str:
     print("Available organizations:")
