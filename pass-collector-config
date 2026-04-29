@@ -295,6 +295,68 @@ def _prompt_choice(prompt: str, choices: list[str], default: str) -> str:
         print(f"Please choose one of: {allowed}")
 
 
+def _extract_orgs_from_payload(payload: Any) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            org_id = value.get("id") or value.get("uuid") or value.get("org_uuid")
+            org_name = value.get("name") or value.get("org_name")
+            if org_id and org_name:
+                found.append({"id": str(org_id), "name": str(org_name)})
+            for nested in value.values():
+                walk(nested)
+            return
+        if isinstance(value, list):
+            for nested in value:
+                walk(nested)
+
+    walk(payload)
+
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for org in found:
+        key = org["id"]
+        if key not in seen:
+            seen.add(key)
+            deduped.append(org)
+    return deduped
+
+
+def list_organizations(session: requests.Session, base_url: str) -> list[dict[str, str]]:
+    endpoints = [
+        f"{base_url}/admin/organizations",
+        f"{base_url}/admin/organizations?format=json",
+        f"{base_url}/api/organizations",
+    ]
+
+    for endpoint in endpoints:
+        try:
+            resp = session.get(endpoint, timeout=15)
+            if resp.status_code >= 400:
+                continue
+            payload = resp.json()
+        except Exception:
+            continue
+
+        orgs = _extract_orgs_from_payload(payload)
+        if orgs:
+            return orgs
+
+    raise RuntimeError("Could not list organizations from Vaultwarden admin/API endpoints")
+
+
+def _prompt_select_organization(orgs: list[dict[str, str]]) -> str:
+    print("Available organizations:")
+    options: list[str] = []
+    for idx, org in enumerate(orgs, start=1):
+        print(f"  {idx}. {org['name']} ({org['id']})")
+        options.append(str(idx))
+
+    selected = _prompt_choice("Choose organization number", options, default="1")
+    return orgs[int(selected) - 1]["id"]
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     _ensure_vw_map_table(db_path)
@@ -456,10 +518,21 @@ def cmd_service_user(args: argparse.Namespace) -> int:
     if not email:
         email = _prompt_value("Service user email", required=True)
 
+    admin_token = args.admin_token or getpass.getpass("Vaultwarden ADMIN_TOKEN: ")
+
+    session = requests.Session()
+
+    admin_login(session, base_url, admin_token)
+
     org_uuid = (args.org_uuid or "").strip()
     if not org_uuid:
         if interactive_mode and _prompt_yes_no("Set organization membership role now?", default=False):
-            org_uuid = _prompt_value("Organization UUID", required=True)
+            try:
+                orgs = list_organizations(session, base_url)
+                org_uuid = _prompt_select_organization(orgs)
+            except RuntimeError as exc:
+                print(f"Could not auto-discover organizations: {exc}")
+                org_uuid = _prompt_value("Organization UUID", required=True)
         elif not interactive_mode:
             org_uuid = _prompt_value("Organization UUID (optional)", required=False)
     org_uuid = org_uuid or None
@@ -469,11 +542,6 @@ def cmd_service_user(args: argparse.Namespace) -> int:
         role_prompt = "Organization role (0=Owner, 1=Admin, 2=User, 3=Manager)"
         org_role = _prompt_choice(role_prompt, ["0", "1", "2", "3"], default=org_role)
 
-    admin_token = args.admin_token or getpass.getpass("Vaultwarden ADMIN_TOKEN: ")
-
-    session = requests.Session()
-
-    admin_login(session, base_url, admin_token)
     invite_result = invite_user(session, base_url, email)
 
     if invite_result.get("already_exists"):

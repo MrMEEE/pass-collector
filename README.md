@@ -123,8 +123,9 @@ Interactive mode is available when running with minimal arguments:
 ./pass-collector-config service-user
 ```
 
-It will prompt for base URL, email, optional org UUID/role, and the admin token.
-In guided mode it asks if you want to set org membership now, instead of always asking for org UUID.
+It will prompt for base URL, email, optional org role setup, and the admin token.
+In guided mode it asks if you want to set org membership now, then tries to list organizations for you to pick from.
+If organization lookup is unavailable, it falls back to asking for org UUID.
 
 Example:
 
