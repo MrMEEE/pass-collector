@@ -2,6 +2,7 @@
 import argparse
 import getpass
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -329,14 +330,46 @@ def _extract_orgs_from_payload(payload: Any) -> list[dict[str, str]]:
     return deduped
 
 
-def list_organizations(session: requests.Session, base_url: str) -> list[dict[str, str]]:
-    endpoints = [
-        f"{base_url}/admin/organizations",
-        f"{base_url}/admin/organizations?format=json",
-        f"{base_url}/api/organizations",
-    ]
+_UUID_RE = re.compile(
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
+    re.IGNORECASE,
+)
 
-    for endpoint in endpoints:
+
+def _extract_orgs_from_html(html: str) -> list[dict[str, str]]:
+    """Extract org UUIDs from Vaultwarden admin HTML page via href scraping."""
+    # Look for /admin/organizations/{uuid} in href attributes to find UUIDs,
+    # then try to pair each UUID with the nearest table-cell text (org name).
+    row_re = re.compile(
+        r'<tr[^>]*>\s*<td[^>]*>\s*([^<]+?)\s*</td>.*?/organizations/(' + _UUID_RE.pattern + r')',
+        re.DOTALL | re.IGNORECASE,
+    )
+    href_re = re.compile(r'/admin/organizations/(' + _UUID_RE.pattern + r')', re.IGNORECASE)
+
+    orgs: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for match in row_re.finditer(html):
+        name = match.group(1).strip()
+        uid = match.group(2).lower()
+        if uid not in seen:
+            seen.add(uid)
+            orgs.append({"id": uid, "name": name})
+
+    # Fallback: if row parsing found nothing, collect bare UUIDs from hrefs
+    if not orgs:
+        for match in href_re.finditer(html):
+            uid = match.group(1).lower()
+            if uid not in seen:
+                seen.add(uid)
+                orgs.append({"id": uid, "name": uid})
+
+    return orgs
+
+
+def list_organizations(session: requests.Session, base_url: str) -> list[dict[str, str]]:
+    # Try JSON endpoint first (works when session has user Bearer token)
+    for endpoint in [f"{base_url}/api/organizations"]:
         try:
             resp = session.get(endpoint, timeout=15)
             if resp.status_code >= 400:
@@ -348,6 +381,16 @@ def list_organizations(session: requests.Session, base_url: str) -> list[dict[st
         orgs = _extract_orgs_from_payload(payload)
         if orgs:
             return orgs
+
+    # Fall back to HTML scraping of the admin panel organizations page
+    try:
+        resp = session.get(f"{base_url}/admin/organizations", timeout=15)
+        if resp.status_code < 400:
+            orgs = _extract_orgs_from_html(resp.text)
+            if orgs:
+                return orgs
+    except Exception:
+        pass
 
     raise RuntimeError("Could not list organizations from Vaultwarden admin/API endpoints")
 
@@ -546,7 +589,8 @@ def cmd_service_user(args: argparse.Namespace) -> int:
                 org_uuid = _prompt_select_organization(orgs)
             except RuntimeError as exc:
                 print(f"Could not auto-discover organizations: {exc}")
-                org_uuid = _prompt_value("Organization UUID", required=True)
+                print("Hint: find org UUIDs in the Vaultwarden admin panel under Organizations.")
+                org_uuid = _prompt_value("Organization UUID (leave blank to skip)", required=False)
         elif not interactive_mode:
             org_uuid = _prompt_value("Organization UUID (optional)", required=False)
     org_uuid = org_uuid or None
