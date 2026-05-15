@@ -35,7 +35,12 @@ Requirements:
 - Vaultwarden API base URL
 - API bearer token **or** client_id + client_secret (token is fetched automatically)
 - optional organization UUID
+- optional collection UUID — **required** for items to be decryptable by org members
 - local SQLite `vaultwarden_item_map` table (auto-created in `data.db`) to track cipher IDs per (`client`, `type`)
+
+> **Note on encryption:** Without a `--vw-collection-id`, items are created as unassigned org ciphers encrypted
+> with the service account's key. Other users will see `[error: cannot decrypt]`. Specifying a collection causes
+> items to be encrypted with the org's shared key via `/api/ciphers/create`, making them readable by all org members.
 
 Example using a static bearer token:
 
@@ -44,7 +49,8 @@ Example using a static bearer token:
 	--backend vaultwarden \
 	--vw-api-url "https://vaultwarden.example.com" \
 	--vw-access-token "..." \
-	--vw-organization-id "..."
+	--vw-organization-id "..." \
+	--vw-collection-id "..."
 ```
 
 Example using client credentials (token is fetched from `/identity/connect/token` at startup):
@@ -55,7 +61,8 @@ Example using client credentials (token is fetched from `/identity/connect/token
 	--vw-api-url "https://vaultwarden.example.com" \
 	--vw-client-id "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
 	--vw-client-secret "..." \
-	--vw-organization-id "..."
+	--vw-organization-id "..." \
+	--vw-collection-id "..."
 ```
 
 Update behavior in Vaultwarden (no read/search required):
@@ -124,7 +131,8 @@ You can also authenticate with client credentials instead of a static bearer tok
 	--vw-api-url "https://vaultwarden.example.com" \
 	--vw-client-id "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
 	--vw-client-secret "..." \
-	--vw-organization-id "..."
+	--vw-organization-id "..." \
+	--vw-collection-id "..."
 ```
 
 Preview what would be migrated without making any API calls:

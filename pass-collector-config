@@ -23,6 +23,7 @@ CONFIG_KEYS = [
     "VW_CLIENT_ID",
     "VW_CLIENT_SECRET",
     "VW_ORGANIZATION_ID",
+    "VW_COLLECTION_ID",
     "VW_VERIFY_SSL",
     "VW_CLIENT_MAP_JSON",
     "VW_TYPE_MAP_JSON",
@@ -197,6 +198,7 @@ def _build_payload(
     name_template: str,
     username_template: str,
     notes_template: str,
+    collection_id: Optional[str] = None,
 ) -> dict[str, Any]:
     mapped_client = client_map.get(client, client)
     mapped_type = type_map.get(cred_type, cred_type)
@@ -218,7 +220,7 @@ def _build_payload(
             "totp": None,
             "uris": [],
         },
-        "collectionIds": [],
+        "collectionIds": [collection_id] if collection_id else [],
         "folderId": None,
         "secureNote": None,
         "card": None,
@@ -486,29 +488,83 @@ def _prompt_select_organization(orgs: list[dict[str, str]]) -> str:
     return orgs[int(selected) - 1]["id"]
 
 
+def list_collections(session: requests.Session, base_url: str, org_id: str) -> list[dict[str, str]]:
+    resp = session.get(f"{base_url}/api/organizations/{org_id}/collections", timeout=15)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Could not list collections ({resp.status_code}): {resp.text.strip()}")
+    data = resp.json()
+    items = data.get("data", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise RuntimeError("Unexpected response format from collections endpoint")
+    result = []
+    for item in items:
+        coll_id = item.get("id") or item.get("Id")
+        coll_name = item.get("name") or item.get("Name") or coll_id
+        if coll_id:
+            result.append({"id": str(coll_id), "name": str(coll_name)})
+    return result
+
+
+def _prompt_select_collection(collections: list[dict[str, str]]) -> str:
+    print("Available collections:")
+    options: list[str] = []
+    for idx, coll in enumerate(collections, start=1):
+        print(f"  {idx}. {coll['name']} ({coll['id']})")
+        options.append(str(idx))
+    selected = _prompt_choice("Choose collection number", options, default="1")
+    return collections[int(selected) - 1]["id"]
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     _ensure_vw_map_table(db_path)
 
     dry_run: bool = getattr(args, "dry_run", False)
 
-    vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL", required=not dry_run)
-    vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
+    # Full interactive mode: URL not available from args or DB config, and not a dry-run.
+    interactive_mode = (
+        not dry_run
+        and not getattr(args, "vw_api_url", None)
+        and not _get_config_value(db_path, "VW_API_URL")
+    )
+
+    # --- Base URL ---
+    vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL")
+    if not vw_api_url and not dry_run:
+        vw_api_url = _prompt_value("Vaultwarden API base URL", required=True)
+    vw_api_url = (vw_api_url or "").rstrip("/")
+
+    # --- SSL ---
     verify_ssl_cfg = _get_config_value(db_path, "VW_VERIFY_SSL")
     verify_ssl = not args.no_verify_ssl and (verify_ssl_cfg or "").lower() not in ("false", "0", "no")
 
+    # --- Field mappings (prompt in full interactive mode) ---
     client_map_json = _resolve_setting(args, db_path, "client_map_json", "VW_CLIENT_MAP_JSON")
     type_map_json = _resolve_setting(args, db_path, "type_map_json", "VW_TYPE_MAP_JSON")
     name_template = _resolve_setting(args, db_path, "name_template", "VW_NAME_TEMPLATE") or "pass-collector:{client}:{type}"
     username_template = _resolve_setting(args, db_path, "username_template", "VW_USERNAME_TEMPLATE") or "{client}"
     notes_template = _resolve_setting(args, db_path, "notes_template", "VW_NOTES_TEMPLATE") or "client={client}; type={type}"
 
+    if interactive_mode:
+        print("\n-- Credential field mapping (press Enter to keep defaults) --")
+        inp = _prompt_value('Type map JSON (e.g. {"ssh":"Linux root"})', default=type_map_json or "")
+        type_map_json = inp or type_map_json
+        inp = _prompt_value('Client map JSON (e.g. {"acme":"ACME-PROD"})', default=client_map_json or "")
+        client_map_json = inp or client_map_json
+        name_template = _prompt_value("Name template", default=name_template) or name_template
+        username_template = _prompt_value("Username template", default=username_template) or username_template
+        notes_template = _prompt_value("Notes template", default=notes_template) or notes_template
+
     client_map = _load_json_map(client_map_json, "VW_CLIENT_MAP_JSON")
     type_map = _load_json_map(type_map_json, "VW_TYPE_MAP_JSON")
 
+    # --- Read credentials from SQLite ---
     entries = _read_credentials(db_path)
 
+    # --- Dry-run shortcut (no auth or network needed) ---
     if dry_run:
+        vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
+        vw_collection_id = _resolve_setting(args, db_path, "vw_collection_id", "VW_COLLECTION_ID")
         preview = []
         for entry in entries:
             client = entry["client"]
@@ -523,6 +579,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
                 name_template=name_template,
                 username_template=username_template,
                 notes_template=notes_template,
+                collection_id=vw_collection_id,
             )
             existing_id = _get_mapped_item_id(db_path, client, cred_type)
             preview.append({
@@ -535,20 +592,118 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         print(json.dumps({"dry_run": True, "total": len(preview), "entries": preview}, indent=2))
         return 0
 
+    # --- Auth ---
     vw_access_token = _resolve_setting(args, db_path, "vw_access_token", "VW_ACCESS_TOKEN")
+    vw_client_id = _resolve_setting(args, db_path, "vw_client_id", "VW_CLIENT_ID")
+    vw_client_secret = _resolve_setting(args, db_path, "vw_client_secret", "VW_CLIENT_SECRET")
+
+    if not vw_access_token and not (vw_client_id and vw_client_secret):
+        print("\n-- Authentication --")
+        auth_method = _prompt_choice(
+            "Authentication method",
+            choices=["token", "client"],
+            default="client",
+        )
+        if auth_method == "token":
+            vw_access_token = getpass.getpass("API bearer token: ")
+        else:
+            vw_client_id = _prompt_value("client_id", required=True)
+            vw_client_secret = getpass.getpass("client_secret: ")
+
     if not vw_access_token:
-        vw_client_id = _resolve_setting(args, db_path, "vw_client_id", "VW_CLIENT_ID")
-        vw_client_secret = _resolve_setting(args, db_path, "vw_client_secret", "VW_CLIENT_SECRET")
         if vw_client_id and vw_client_secret:
-            vw_access_token = _fetch_bearer_token(vw_api_url.rstrip("/"), vw_client_id, vw_client_secret, verify_ssl)
+            vw_access_token = _fetch_bearer_token(vw_api_url, vw_client_id, vw_client_secret, verify_ssl)
         else:
             raise RuntimeError(
                 "VW_ACCESS_TOKEN or both VW_CLIENT_ID and VW_CLIENT_SECRET are required. "
                 "Provide --vw-access-token, or both --vw-client-id and --vw-client-secret."
             )
 
-    session = _create_session(vw_api_url.rstrip("/"), vw_access_token, verify_ssl=verify_ssl)
+    session = _create_session(vw_api_url, vw_access_token, verify_ssl=verify_ssl)
 
+    # --- Organization ---
+    vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
+    if not vw_organization_id:
+        print("\n-- Organization --")
+        try:
+            orgs = list_organizations(session, vw_api_url)
+            if orgs:
+                vw_organization_id = _prompt_select_organization(orgs)
+            else:
+                vw_organization_id = _prompt_value("Organization UUID (optional)", required=False) or None
+        except RuntimeError as exc:
+            print(f"Could not auto-discover organizations: {exc}")
+            vw_organization_id = _prompt_value("Organization UUID (optional)", required=False) or None
+
+    # --- Collection ---
+    vw_collection_id = _resolve_setting(args, db_path, "vw_collection_id", "VW_COLLECTION_ID")
+    if not vw_collection_id and vw_organization_id:
+        print("\n-- Collection --")
+        print("Without a collection, items are encrypted with the service account key and")
+        print("other users will see [error: cannot decrypt].")
+        try:
+            collections = list_collections(session, vw_api_url, vw_organization_id)
+            if collections:
+                if _prompt_yes_no("Assign items to a collection?", default=True):
+                    vw_collection_id = _prompt_select_collection(collections)
+            else:
+                vw_collection_id = _prompt_value("Collection UUID (optional)", required=False) or None
+        except RuntimeError as exc:
+            print(f"Could not list collections: {exc}")
+            vw_collection_id = _prompt_value("Collection UUID (optional)", required=False) or None
+
+    # --- Save settings to DB ---
+    if interactive_mode and _prompt_yes_no("\nSave these settings to data.db for future runs?", default=True):
+        to_save = [
+            ("VW_API_URL", vw_api_url),
+            ("VW_ORGANIZATION_ID", vw_organization_id),
+            ("VW_COLLECTION_ID", vw_collection_id),
+            ("VW_TYPE_MAP_JSON", type_map_json),
+            ("VW_CLIENT_MAP_JSON", client_map_json),
+        ]
+        if name_template != "pass-collector:{client}:{type}":
+            to_save.append(("VW_NAME_TEMPLATE", name_template))
+        if username_template != "{client}":
+            to_save.append(("VW_USERNAME_TEMPLATE", username_template))
+        if notes_template != "client={client}; type={type}":
+            to_save.append(("VW_NOTES_TEMPLATE", notes_template))
+        for key, val in to_save:
+            if val:
+                _set_config_value(db_path, key, val)
+        print("Settings saved (credentials not saved for security).")
+
+    # --- Optional dry-run preview before live migration ---
+    if interactive_mode and _prompt_yes_no(f"\nPreview {len(entries)} item(s) before migrating?", default=True):
+        preview = []
+        for entry in entries:
+            client = entry["client"]
+            cred_type = entry["type"]
+            payload = _build_payload(
+                client=client,
+                secret="***",
+                cred_type=cred_type,
+                org_id=vw_organization_id,
+                client_map=client_map,
+                type_map=type_map,
+                name_template=name_template,
+                username_template=username_template,
+                notes_template=notes_template,
+                collection_id=vw_collection_id,
+            )
+            existing_id = _get_mapped_item_id(db_path, client, cred_type)
+            preview.append({
+                "client": client,
+                "type": cred_type,
+                "action": "update" if existing_id else "create",
+                "existing_cipher_id": existing_id,
+                "vaultwarden_payload": payload,
+            })
+        print(json.dumps({"dry_run": True, "total": len(preview), "entries": preview}, indent=2))
+        if not _prompt_yes_no(f"\nProceed with migrating {len(entries)} item(s)?", default=False):
+            print("Migration cancelled.")
+            return 0
+
+    # --- Run migration ---
     migrated = 0
     failures: list[dict[str, str]] = []
 
@@ -560,7 +715,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         try:
             old_id = _get_mapped_item_id(db_path, client, cred_type)
             if old_id:
-                delete_resp = session.delete(f"{vw_api_url.rstrip('/')}/api/ciphers/{quote_plus(old_id)}", timeout=20)
+                delete_resp = session.delete(f"{vw_api_url}/api/ciphers/{quote_plus(old_id)}", timeout=20)
                 if delete_resp.status_code not in (200, 204, 404, 410):
                     _raise_for_http(delete_resp, "Delete existing cipher")
 
@@ -574,8 +729,12 @@ def cmd_migrate(args: argparse.Namespace) -> int:
                 name_template=name_template,
                 username_template=username_template,
                 notes_template=notes_template,
+                collection_id=vw_collection_id,
             )
-            create_resp = session.post(f"{vw_api_url.rstrip('/')}/api/ciphers", json=payload, timeout=20)
+            if vw_collection_id:
+                create_resp = session.post(f"{vw_api_url}/api/ciphers/create", json={"cipher": payload, "collectionIds": [vw_collection_id]}, timeout=20)
+            else:
+                create_resp = session.post(f"{vw_api_url}/api/ciphers", json=payload, timeout=20)
             _raise_for_http(create_resp, "Create cipher")
             new_id = _extract_cipher_id(create_resp.json())
             _upsert_mapped_item_id(db_path, client, cred_type, new_id)
@@ -780,6 +939,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "vw_client_id": "VW_CLIENT_ID",
         "vw_client_secret": "VW_CLIENT_SECRET",
         "vw_organization_id": "VW_ORGANIZATION_ID",
+        "vw_collection_id": "VW_COLLECTION_ID",
         "vw_verify_ssl": "VW_VERIFY_SSL",
         "client_map_json": "VW_CLIENT_MAP_JSON",
         "type_map_json": "VW_TYPE_MAP_JSON",
@@ -830,6 +990,7 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--vw-client-id", default=None, help="Vaultwarden API client_id (used to fetch bearer token if --vw-access-token is not set)")
     migrate.add_argument("--vw-client-secret", default=None, help="Vaultwarden API client_secret (used to fetch bearer token if --vw-access-token is not set)")
     migrate.add_argument("--vw-organization-id", default=None, help="Optional organization UUID")
+    migrate.add_argument("--vw-collection-id", default=None, help="Org collection UUID — items are assigned here and encrypted with the org key (required for shared visibility)")
     migrate.add_argument("--client-map-json", default=None, help="JSON map for client remapping")
     migrate.add_argument("--type-map-json", default=None, help="JSON map for type remapping")
     migrate.add_argument("--name-template", default=None, help="Vaultwarden item name template")
@@ -849,6 +1010,7 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--vw-client-id", default=None)
     config.add_argument("--vw-client-secret", default=None)
     config.add_argument("--vw-organization-id", default=None)
+    config.add_argument("--vw-collection-id", default=None)
     config.add_argument("--client-map-json", default=None)
     config.add_argument("--type-map-json", default=None)
     config.add_argument("--name-template", default=None)

@@ -212,7 +212,7 @@ class VaultwardenMapping:
         mapped_type = self.type_map.get(cred_type, cred_type)
         return mapped_client, mapped_type
 
-    def make_cipher_payload(self, client: str, secret: str, cred_type: str, organization_id: Optional[str]) -> dict[str, Any]:
+    def make_cipher_payload(self, client: str, secret: str, cred_type: str, organization_id: Optional[str], collection_id: Optional[str] = None) -> dict[str, Any]:
         mapped_client, mapped_type = self.map_values(client, cred_type)
         values = {
             "client": mapped_client,
@@ -231,7 +231,7 @@ class VaultwardenMapping:
                 "totp": None,
                 "uris": [],
             },
-            "collectionIds": [],
+            "collectionIds": [collection_id] if collection_id else [],
             "folderId": None,
             "secureNote": None,
             "card": None,
@@ -244,8 +244,9 @@ class VaultwardenMapping:
 
 
 class VaultwardenBackend(CredentialBackend):
-    def __init__(self, organization_id: Optional[str] = None) -> None:
+    def __init__(self, organization_id: Optional[str] = None, collection_id: Optional[str] = None) -> None:
         self.organization_id = organization_id
+        self.collection_id = collection_id
         self.base_url = (cfg("VW_API_URL", "") or "").rstrip("/")
         self.mapping = VaultwardenMapping()
 
@@ -332,10 +333,13 @@ class VaultwardenBackend(CredentialBackend):
         raise RuntimeError("Vaultwarden create response did not include cipher id")
 
     def save(self, client: str, secret: str, cred_type: str) -> None:
-        payload = self.mapping.make_cipher_payload(client, secret, cred_type, self.organization_id)
+        payload = self.mapping.make_cipher_payload(client, secret, cred_type, self.organization_id, self.collection_id)
 
         self._delete_cipher_if_known(client, cred_type)
-        created = self._request("POST", "/api/ciphers", payload)
+        if self.collection_id:
+            created = self._request("POST", "/api/ciphers/create", {"cipher": payload, "collectionIds": [self.collection_id]})
+        else:
+            created = self._request("POST", "/api/ciphers", payload)
         new_id = self._extract_cipher_id(created)
         STORE.upsert_vaultwarden_item_id(client, cred_type, new_id)
 
@@ -351,7 +355,8 @@ def build_backend() -> CredentialBackend:
         return SQLiteBackend()
     if backend_name == "vaultwarden":
         org_id = cfg("VW_ORGANIZATION_ID")
-        return VaultwardenBackend(organization_id=org_id)
+        collection_id = cfg("VW_COLLECTION_ID")
+        return VaultwardenBackend(organization_id=org_id, collection_id=collection_id)
     raise RuntimeError("Unsupported BACKEND value. Use 'sqlite' or 'vaultwarden'.")
 
 
