@@ -19,6 +19,8 @@ CONFIG_KEYS = [
     "BACKEND",
     "VW_API_URL",
     "VW_ACCESS_TOKEN",
+    "VW_CLIENT_ID",
+    "VW_CLIENT_SECRET",
     "VW_ORGANIZATION_ID",
     "VW_VERIFY_SSL",
     "VW_CLIENT_MAP_JSON",
@@ -242,6 +244,31 @@ def _extract_cipher_id(payload: Any) -> str:
     raise RuntimeError("Vaultwarden create response did not include cipher id")
 
 
+def _fetch_bearer_token(base_url: str, client_id: str, client_secret: str, verify_ssl: bool = True) -> str:
+    url = f"{base_url}/identity/connect/token"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": "api",
+            },
+            verify=verify_ssl,
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Token request to {url} failed: {exc}") from exc
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Token request failed ({resp.status_code}): {resp.text.strip()}")
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError("Token response did not include access_token")
+    return str(token)
+
+
 def _create_session(vw_api_url: str, vw_access_token: str, verify_ssl: bool = True) -> requests.Session:
     s = requests.Session()
     s.headers.update(
@@ -459,8 +486,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     _ensure_vw_map_table(db_path)
 
-    vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL", required=True)
-    vw_access_token = _resolve_setting(args, db_path, "vw_access_token", "VW_ACCESS_TOKEN", required=True)
+    dry_run: bool = getattr(args, "dry_run", False)
+
+    vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL", required=not dry_run)
     vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
     verify_ssl_cfg = _get_config_value(db_path, "VW_VERIFY_SSL")
     verify_ssl = not args.no_verify_ssl and (verify_ssl_cfg or "").lower() not in ("false", "0", "no")
@@ -474,8 +502,48 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     client_map = _load_json_map(client_map_json, "VW_CLIENT_MAP_JSON")
     type_map = _load_json_map(type_map_json, "VW_TYPE_MAP_JSON")
 
-    session = _create_session(vw_api_url.rstrip("/"), vw_access_token, verify_ssl=verify_ssl)
     entries = _read_credentials(db_path)
+
+    if dry_run:
+        preview = []
+        for entry in entries:
+            client = entry["client"]
+            cred_type = entry["type"]
+            payload = _build_payload(
+                client=client,
+                secret="***",
+                cred_type=cred_type,
+                org_id=vw_organization_id,
+                client_map=client_map,
+                type_map=type_map,
+                name_template=name_template,
+                username_template=username_template,
+                notes_template=notes_template,
+            )
+            existing_id = _get_mapped_item_id(db_path, client, cred_type)
+            preview.append({
+                "client": client,
+                "type": cred_type,
+                "action": "update" if existing_id else "create",
+                "existing_cipher_id": existing_id,
+                "vaultwarden_payload": payload,
+            })
+        print(json.dumps({"dry_run": True, "total": len(preview), "entries": preview}, indent=2))
+        return 0
+
+    vw_access_token = _resolve_setting(args, db_path, "vw_access_token", "VW_ACCESS_TOKEN")
+    if not vw_access_token:
+        vw_client_id = _resolve_setting(args, db_path, "vw_client_id", "VW_CLIENT_ID")
+        vw_client_secret = _resolve_setting(args, db_path, "vw_client_secret", "VW_CLIENT_SECRET")
+        if vw_client_id and vw_client_secret:
+            vw_access_token = _fetch_bearer_token(vw_api_url.rstrip("/"), vw_client_id, vw_client_secret, verify_ssl)
+        else:
+            raise RuntimeError(
+                "VW_ACCESS_TOKEN or both VW_CLIENT_ID and VW_CLIENT_SECRET are required. "
+                "Provide --vw-access-token, or both --vw-client-id and --vw-client-secret."
+            )
+
+    session = _create_session(vw_api_url.rstrip("/"), vw_access_token, verify_ssl=verify_ssl)
 
     migrated = 0
     failures: list[dict[str, str]] = []
@@ -705,6 +773,8 @@ def cmd_config(args: argparse.Namespace) -> int:
         "backend": "BACKEND",
         "vw_api_url": "VW_API_URL",
         "vw_access_token": "VW_ACCESS_TOKEN",
+        "vw_client_id": "VW_CLIENT_ID",
+        "vw_client_secret": "VW_CLIENT_SECRET",
         "vw_organization_id": "VW_ORGANIZATION_ID",
         "vw_verify_ssl": "VW_VERIFY_SSL",
         "client_map_json": "VW_CLIENT_MAP_JSON",
@@ -753,6 +823,8 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")
     migrate.add_argument("--vw-api-url", default=None, help="Vaultwarden API base URL (defaults to DB config VW_API_URL)")
     migrate.add_argument("--vw-access-token", default=None, help="Vaultwarden API bearer token (defaults to DB config VW_ACCESS_TOKEN)")
+    migrate.add_argument("--vw-client-id", default=None, help="Vaultwarden API client_id (used to fetch bearer token if --vw-access-token is not set)")
+    migrate.add_argument("--vw-client-secret", default=None, help="Vaultwarden API client_secret (used to fetch bearer token if --vw-access-token is not set)")
     migrate.add_argument("--vw-organization-id", default=None, help="Optional organization UUID")
     migrate.add_argument("--client-map-json", default=None, help="JSON map for client remapping")
     migrate.add_argument("--type-map-json", default=None, help="JSON map for type remapping")
@@ -760,6 +832,7 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--username-template", default=None, help="Vaultwarden username template")
     migrate.add_argument("--notes-template", default=None, help="Vaultwarden notes template")
     migrate.add_argument("--no-verify-ssl", action="store_true", default=False, help="Disable SSL certificate verification (accept self-signed certs)")
+    migrate.add_argument("--dry-run", action="store_true", default=False, help="Show what would be migrated without making any API calls")
     migrate.set_defaults(func=cmd_migrate)
 
     config = sub.add_parser("config", help="Read/write pass-collector config stored in SQLite")
@@ -769,6 +842,8 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--backend", choices=["sqlite", "vaultwarden"], default=None)
     config.add_argument("--vw-api-url", default=None)
     config.add_argument("--vw-access-token", default=None)
+    config.add_argument("--vw-client-id", default=None)
+    config.add_argument("--vw-client-secret", default=None)
     config.add_argument("--vw-organization-id", default=None)
     config.add_argument("--client-map-json", default=None)
     config.add_argument("--type-map-json", default=None)

@@ -33,17 +33,28 @@ or:
 Requirements:
 
 - Vaultwarden API base URL
-- API bearer token
+- API bearer token **or** client_id + client_secret (token is fetched automatically)
 - optional organization UUID
 - local SQLite `vaultwarden_item_map` table (auto-created in `data.db`) to track cipher IDs per (`client`, `type`)
 
-Example:
+Example using a static bearer token:
 
 ```bash
 ./pass-collector-config config \
 	--backend vaultwarden \
 	--vw-api-url "https://vaultwarden.example.com" \
 	--vw-access-token "..." \
+	--vw-organization-id "..."
+```
+
+Example using client credentials (token is fetched from `/identity/connect/token` at startup):
+
+```bash
+./pass-collector-config config \
+	--backend vaultwarden \
+	--vw-api-url "https://vaultwarden.example.com" \
+	--vw-client-id "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
+	--vw-client-secret "..." \
 	--vw-organization-id "..."
 ```
 
@@ -104,6 +115,25 @@ Use the configuration CLI (not a service endpoint):
 	--username-template '{client}' \
 	--notes-template 'source=pass-collector; raw={raw_client}/{raw_type}'
 ```
+
+You can also authenticate with client credentials instead of a static bearer token:
+
+```bash
+./pass-collector-config migrate \
+	--db-path /opt/pass-collector/data.db \
+	--vw-api-url "https://vaultwarden.example.com" \
+	--vw-client-id "user.xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
+	--vw-client-secret "..." \
+	--vw-organization-id "..."
+```
+
+Preview what would be migrated without making any API calls:
+
+```bash
+./pass-collector-config migrate --dry-run
+```
+
+Dry-run requires no credentials — it reads from SQLite, applies all mappings, and prints the Vaultwarden payloads that would be sent (secrets masked as `***`).
 
 The command prints a JSON summary with total, migrated, failed, and per-entry failures.
 

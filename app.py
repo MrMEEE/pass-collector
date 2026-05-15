@@ -15,6 +15,31 @@ DB_PATH = Path(__file__).with_name("data.db")
 app = Flask(__name__)
 
 
+def _fetch_bearer_token(base_url: str, client_id: str, client_secret: str, verify_ssl: bool = True) -> str:
+    url = f"{base_url}/identity/connect/token"
+    try:
+        resp = requests.post(
+            url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": "api",
+            },
+            verify=verify_ssl,
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Token request to {url} failed: {exc}") from exc
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Token request failed ({resp.status_code}): {resp.text.strip()}")
+    data = resp.json()
+    token = data.get("access_token")
+    if not token:
+        raise RuntimeError("Token response did not include access_token")
+    return str(token)
+
+
 class SQLiteStore:
     def get_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(DB_PATH)
@@ -218,24 +243,34 @@ class VaultwardenBackend(CredentialBackend):
     def __init__(self, organization_id: Optional[str] = None) -> None:
         self.organization_id = organization_id
         self.base_url = (cfg("VW_API_URL", "") or "").rstrip("/")
-        self.token = cfg("VW_ACCESS_TOKEN")
         self.mapping = VaultwardenMapping()
 
         if not self.base_url:
             raise RuntimeError("VW_API_URL is required when BACKEND=vaultwarden")
-        if not self.token:
-            raise RuntimeError("VW_ACCESS_TOKEN is required when BACKEND=vaultwarden")
+
+        verify_ssl_raw = (cfg("VW_VERIFY_SSL", "true") or "true").lower()
+        verify_ssl = verify_ssl_raw not in ("false", "0", "no")
+
+        token = cfg("VW_ACCESS_TOKEN")
+        if not token:
+            client_id = cfg("VW_CLIENT_ID")
+            client_secret = cfg("VW_CLIENT_SECRET")
+            if client_id and client_secret:
+                token = _fetch_bearer_token(self.base_url, client_id, client_secret, verify_ssl)
+        if not token:
+            raise RuntimeError(
+                "VW_ACCESS_TOKEN or both VW_CLIENT_ID and VW_CLIENT_SECRET are required when BACKEND=vaultwarden"
+            )
 
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "Authorization": f"Bearer {self.token}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
             }
         )
-        verify_ssl_raw = (cfg("VW_VERIFY_SSL", "true") or "true").lower()
-        self.session.verify = verify_ssl_raw not in ("false", "0", "no")
-        if not self.session.verify:
+        self.session.verify = verify_ssl
+        if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
