@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import urllib3
+import uuid
 from pathlib import Path
 from typing import Any, Optional, Union
 from urllib.parse import quote_plus
@@ -25,6 +26,9 @@ def _fetch_bearer_token(base_url: str, client_id: str, client_secret: str, verif
                 "client_id": client_id,
                 "client_secret": client_secret,
                 "scope": "api",
+                "DeviceIdentifier": str(uuid.uuid4()),
+                "DeviceType": "21",
+                "DeviceName": "pass-collector",
             },
             verify=verify_ssl,
             timeout=15,
