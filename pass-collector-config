@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import getpass
 import html
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -14,6 +16,15 @@ from urllib.parse import quote, quote_plus
 import urllib3
 
 import requests
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hmac as _crypto_hmac
+from cryptography.hazmat.primitives import padding as _sym_padding
+from cryptography.hazmat.primitives.asymmetric import padding as _asym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.serialization import load_der_private_key
 
 DEFAULT_DB_PATH = Path(__file__).with_name("data.db")
 CONFIG_KEYS = [
@@ -22,6 +33,7 @@ CONFIG_KEYS = [
     "VW_ACCESS_TOKEN",
     "VW_CLIENT_ID",
     "VW_CLIENT_SECRET",
+    "VW_SYM_KEY",
     "VW_ORGANIZATION_ID",
     "VW_COLLECTION_ID",
     "VW_VERIFY_SSL",
@@ -188,6 +200,167 @@ def _upsert_mapped_item_id(db_path: Path, client: str, cred_type: str, item_id: 
         conn.close()
 
 
+def _bw_encrypt(plaintext: str, enc_key: bytes, mac_key: bytes) -> str:
+    """Encrypt a UTF-8 string to Bitwarden EncString format '2.iv|ct|mac'."""
+    iv = os.urandom(16)
+    padder = _sym_padding.PKCS7(128).padder()
+    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ct = encryptor.update(padded) + encryptor.finalize()
+    h = _crypto_hmac.HMAC(mac_key, hashes.SHA256())
+    h.update(iv + ct)
+    mac = h.finalize()
+    return (
+        f"2.{base64.b64encode(iv).decode()}"
+        f"|{base64.b64encode(ct).decode()}"
+        f"|{base64.b64encode(mac).decode()}"
+    )
+
+
+def _bw_decrypt_enc_string(enc_string: str, enc_key: bytes, mac_key: bytes) -> bytes:
+    """Decrypt a Bitwarden EncString type 2 ('2.iv|ct|mac') to raw bytes."""
+    if not enc_string.startswith("2."):
+        raise ValueError(f"Unsupported EncString type: {enc_string[:3]!r}")
+    _, rest = enc_string.split(".", 1)
+    parts = rest.split("|")
+    iv = base64.b64decode(parts[0])
+    ct = base64.b64decode(parts[1])
+    mac_bytes = base64.b64decode(parts[2])
+    h = _crypto_hmac.HMAC(mac_key, hashes.SHA256())
+    h.update(iv + ct)
+    try:
+        h.verify(mac_bytes)
+    except InvalidSignature as exc:
+        raise ValueError("MAC verification failed — wrong decryption key or corrupted data") from exc
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+    unpadder = _sym_padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+def _bw_derive_master_key(
+    email: str,
+    password: str,
+    kdf_type: int,
+    kdf_iterations: int,
+    kdf_memory: Optional[int] = None,
+    kdf_parallelism: Optional[int] = None,
+) -> bytes:
+    """Derive the 32-byte Bitwarden master key from email + password."""
+    salt = email.strip().lower().encode("utf-8")
+    secret = password.encode("utf-8")
+    if kdf_type == 0:  # PBKDF2-SHA256
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=kdf_iterations)
+        return kdf.derive(secret)
+    if kdf_type == 1:  # Argon2id
+        try:
+            from argon2.low_level import Type, hash_secret_raw  # type: ignore[import]
+        except ImportError as exc:
+            raise RuntimeError("argon2-cffi is required for Argon2id KDF: pip install argon2-cffi") from exc
+        mem_kb = (kdf_memory or 64) * 1024  # Bitwarden stores MB; argon2 wants KB
+        return hash_secret_raw(
+            secret=secret,
+            salt=salt,
+            time_cost=kdf_iterations or 3,
+            memory_cost=mem_kb,
+            parallelism=kdf_parallelism or 4,
+            hash_len=32,
+            type=Type.ID,
+        )
+    raise ValueError(f"Unsupported KDF type {kdf_type}")
+
+
+def _bw_stretch_master_key(master_key: bytes) -> tuple[bytes, bytes]:
+    """Stretch a 32-byte master key to (enc_key, mac_key) using HKDF-Expand."""
+    enc_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"enc").derive(master_key)
+    mac_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"mac").derive(master_key)
+    return enc_key, mac_key
+
+
+def _bw_get_sym_keys(
+    session: requests.Session,
+    base_url: str,
+    master_password: str,
+    org_id: Optional[str] = None,
+) -> tuple[bytes, bytes]:
+    """Return (enc_key, mac_key) for encrypting Vaultwarden ciphers.
+
+    If org_id is given, returns the org's shared symmetric key so that items
+    placed in that org's collections are readable by all members.
+    Otherwise returns the user's personal symmetric key.
+
+    Requires the service account's master password.
+    """
+    resp = session.get(f"{base_url}/api/sync?excludeDomains=true", timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Sync failed ({resp.status_code}): {resp.text.strip()}")
+    data = resp.json()
+    profile = data.get("profile") or data.get("Profile") or data
+
+    email = profile.get("email") or profile.get("Email") or ""
+    kdf_type = profile.get("kdf") if profile.get("kdf") is not None else (profile.get("Kdf") or 0)
+    kdf_iter = profile.get("kdfIterations") or profile.get("KdfIterations") or 600_000
+    kdf_mem = profile.get("kdfMemory") or profile.get("KdfMemory")
+    kdf_par = profile.get("kdfParallelism") or profile.get("KdfParallelism")
+
+    master_key = _bw_derive_master_key(email, master_password, int(kdf_type), int(kdf_iter), kdf_mem, kdf_par)
+    stretched_enc, stretched_mac = _bw_stretch_master_key(master_key)
+
+    # Decrypt user's 64-byte symmetric key stored in Profile.Key
+    profile_key_str = profile.get("key") or profile.get("Key") or ""
+    if not profile_key_str:
+        raise RuntimeError("Sync profile is missing 'key' field — cannot derive encryption keys")
+    user_sym_bytes = _bw_decrypt_enc_string(profile_key_str, stretched_enc, stretched_mac)
+    user_enc_key = user_sym_bytes[:32]
+    user_mac_key = user_sym_bytes[32:64]
+
+    if not org_id:
+        return user_enc_key, user_mac_key
+
+    # For org ciphers: decrypt org symmetric key via user's RSA private key.
+    priv_key_str = profile.get("privateKey") or profile.get("PrivateKey") or ""
+    if not priv_key_str:
+        raise RuntimeError("Sync profile is missing 'privateKey' — cannot decrypt org encryption key")
+    priv_key_der = _bw_decrypt_enc_string(priv_key_str, user_enc_key, user_mac_key)
+    rsa_key = load_der_private_key(priv_key_der, password=None)
+
+    orgs_list = profile.get("organizations") or profile.get("Organizations") or []
+    org_entry = next(
+        (o for o in orgs_list if (o.get("id") or o.get("Id") or "").lower() == org_id.lower()),
+        None,
+    )
+    if org_entry is None:
+        raise RuntimeError(
+            f"Organization {org_id} not found in sync profile. "
+            "Make sure the service account is a member of that organization."
+        )
+    org_key_str = org_entry.get("key") or org_entry.get("Key") or ""
+    if not org_key_str:
+        raise RuntimeError(f"Organization {org_id} has no 'key' in the sync profile")
+
+    # Type 4: RSA-OAEP encrypted (standard Bitwarden format)
+    if org_key_str.startswith("4."):
+        rsa_ct = base64.b64decode(org_key_str[2:])
+        org_sym_bytes = rsa_key.decrypt(
+            rsa_ct,
+            _asym_padding.OAEP(
+                mgf=_asym_padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None,
+            ),
+        )
+        return org_sym_bytes[:32], org_sym_bytes[32:64]
+
+    # Type 2: symmetric (older/non-standard format)
+    if org_key_str.startswith("2."):
+        org_sym_bytes = _bw_decrypt_enc_string(org_key_str, user_enc_key, user_mac_key)
+        return org_sym_bytes[:32], org_sym_bytes[32:64]
+
+    raise ValueError(f"Unsupported org key EncString type: {org_key_str[:3]!r}")
+
+
 def _build_payload(
     client: str,
     secret: str,
@@ -199,6 +372,7 @@ def _build_payload(
     username_template: str,
     notes_template: str,
     collection_id: Optional[str] = None,
+    sym_keys: Optional[tuple[bytes, bytes]] = None,
 ) -> dict[str, Any]:
     mapped_client = client_map.get(client, client)
     mapped_type = type_map.get(cred_type, cred_type)
@@ -209,14 +383,19 @@ def _build_payload(
         "raw_type": cred_type,
     }
 
+    def _enc(s: str) -> str:
+        if sym_keys:
+            return _bw_encrypt(s, sym_keys[0], sym_keys[1])
+        return s
+
     payload: dict[str, Any] = {
         "type": 1,
-        "name": name_template.format(**values),
-        "notes": notes_template.format(**values),
+        "name": _enc(name_template.format(**values)),
+        "notes": _enc(notes_template.format(**values)),
         "favorite": False,
         "login": {
-            "username": username_template.format(**values),
-            "password": secret,
+            "username": _enc(username_template.format(**values)),
+            "password": _enc(secret),
             "totp": None,
             "uris": [],
         },
@@ -506,10 +685,11 @@ def list_collections(session: requests.Session, base_url: str, org_id: str) -> l
 
 
 def _prompt_select_collection(collections: list[dict[str, str]]) -> str:
-    print("Available collections:")
+    # Collection names are client-side encrypted; only the UUID is usable here.
+    print("Available collections (names are encrypted and cannot be displayed):")
     options: list[str] = []
     for idx, coll in enumerate(collections, start=1):
-        print(f"  {idx}. {coll['name']} ({coll['id']})")
+        print(f"  {idx}. {coll['id']}")
         options.append(str(idx))
     selected = _prompt_choice("Choose collection number", options, default="1")
     return collections[int(selected) - 1]["id"]
@@ -652,6 +832,48 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             print(f"Could not list collections: {exc}")
             vw_collection_id = _prompt_value("Collection UUID (optional)", required=False) or None
 
+    # --- Encryption keys (master password required) ---
+    # Vaultwarden is end-to-end encrypted: all cipher fields must be encrypted
+    # with the org's (or user's) symmetric key before being sent to the API.
+    #
+    # First check if a pre-derived sym key is already stored (avoids re-prompting).
+    sym_keys: Optional[tuple[bytes, bytes]] = None
+    stored_sym_key = _get_config_value(db_path, "VW_SYM_KEY")
+    if stored_sym_key:
+        try:
+            raw = base64.b64decode(stored_sym_key)
+            sym_keys = (raw[:32], raw[32:64])
+            print("Using stored encryption key (VW_SYM_KEY).")
+        except Exception:
+            stored_sym_key = None  # fall through to password prompt
+
+    if sym_keys is None:
+        print("\n-- Encryption --")
+        print("Vaultwarden is end-to-end encrypted. The service account's master password")
+        print("is required to derive the encryption key. It is never stored.")
+        master_password = getpass.getpass("Service account master password: ")
+        try:
+            sym_keys = _bw_get_sym_keys(
+                session, vw_api_url, master_password, vw_organization_id
+            )
+            print("Encryption keys derived successfully.")
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            print("This usually means the master password is wrong.")
+            raise SystemExit(1)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            raise SystemExit(1)
+
+        # Offer to save the derived key (not the master password) for the live backend.
+        print("\nThe derived symmetric key (not the master password) can be saved to")
+        print("data.db so the live backend (app.py) can encrypt new incoming credentials.")
+        print("The master password itself is never stored.")
+        if _prompt_yes_no("Save encryption key to data.db for live backend?", default=False):
+            encoded = base64.b64encode(sym_keys[0] + sym_keys[1]).decode()
+            _set_config_value(db_path, "VW_SYM_KEY", encoded)
+            print("VW_SYM_KEY saved.")
+
     # --- Save settings to DB ---
     if interactive_mode and _prompt_yes_no("\nSave these settings to data.db for future runs?", default=True):
         to_save = [
@@ -689,6 +911,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
                 username_template=username_template,
                 notes_template=notes_template,
                 collection_id=vw_collection_id,
+                # sym_keys intentionally omitted: preview shows plaintext templates
             )
             existing_id = _get_mapped_item_id(db_path, client, cred_type)
             preview.append({
@@ -730,6 +953,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
                 username_template=username_template,
                 notes_template=notes_template,
                 collection_id=vw_collection_id,
+                sym_keys=sym_keys,
             )
             if vw_collection_id:
                 create_resp = session.post(f"{vw_api_url}/api/ciphers/create", json={"cipher": payload, "collectionIds": [vw_collection_id]}, timeout=20)
@@ -966,6 +1190,57 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fetch_key(args: argparse.Namespace) -> int:
+    """Derive the Vaultwarden symmetric encryption key from the master password
+    and save it as VW_SYM_KEY in data.db.
+
+    The master password is entered once via a secure prompt and is never stored.
+    VW_SYM_KEY is the 64-byte derived key (enc+mac) encoded as base64. It
+    cannot be used to log in to Vaultwarden — only to encrypt/decrypt ciphers.
+    """
+    db_path = Path(args.db_path)
+
+    vw_api_url = _resolve_setting(args, db_path, "vw_api_url", "VW_API_URL")
+    if not vw_api_url:
+        vw_api_url = _prompt_value("Vaultwarden API base URL", required=True)
+    vw_api_url = vw_api_url.rstrip("/")
+
+    verify_ssl_cfg = _get_config_value(db_path, "VW_VERIFY_SSL")
+    verify_ssl = not args.no_verify_ssl and (verify_ssl_cfg or "").lower() not in ("false", "0", "no")
+
+    vw_access_token = _resolve_setting(args, db_path, "vw_access_token", "VW_ACCESS_TOKEN")
+    if not vw_access_token:
+        vw_client_id = _resolve_setting(args, db_path, "vw_client_id", "VW_CLIENT_ID")
+        vw_client_secret = _resolve_setting(args, db_path, "vw_client_secret", "VW_CLIENT_SECRET")
+        if vw_client_id and vw_client_secret:
+            vw_access_token = _fetch_bearer_token(vw_api_url, vw_client_id, vw_client_secret, verify_ssl)
+        else:
+            vw_access_token = getpass.getpass("API bearer token (or set VW_ACCESS_TOKEN / VW_CLIENT_ID+SECRET): ")
+
+    session = _create_session(vw_api_url, vw_access_token, verify_ssl=verify_ssl)
+
+    vw_organization_id = _resolve_setting(args, db_path, "vw_organization_id", "VW_ORGANIZATION_ID")
+
+    master_password = getpass.getpass("Service account master password: ")
+
+    try:
+        sym_keys = _bw_get_sym_keys(session, vw_api_url, master_password, vw_organization_id)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        print("This usually means the master password is wrong.")
+        return 1
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}")
+        return 1
+
+    encoded = base64.b64encode(sym_keys[0] + sym_keys[1]).decode()
+    _set_config_value(db_path, "VW_SYM_KEY", encoded)
+    print(f"VW_SYM_KEY saved to {db_path}.")
+    print("The live backend (app.py) will now encrypt new credentials with the org key.")
+    print("Restart the pass-collector service to pick up the new key.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pass-collector-config",
@@ -982,6 +1257,16 @@ def build_parser() -> argparse.ArgumentParser:
     service_user.add_argument("--org-role", default="2", choices=["0", "1", "2", "3"], help="0=Owner,1=Admin,2=User,3=Manager")
     service_user.add_argument("--no-verify-ssl", action="store_true", default=False, help="Disable SSL certificate verification (accept self-signed certs)")
     service_user.set_defaults(func=cmd_service_user)
+
+    fetch_key = sub.add_parser("fetch-key", help="Derive and store the Vaultwarden encryption key from the master password (entered once, never stored)")
+    fetch_key.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")
+    fetch_key.add_argument("--vw-api-url", default=None, help="Vaultwarden API base URL (falls back to DB config VW_API_URL)")
+    fetch_key.add_argument("--vw-access-token", default=None, help="Vaultwarden API bearer token")
+    fetch_key.add_argument("--vw-client-id", default=None, help="Vaultwarden API client_id")
+    fetch_key.add_argument("--vw-client-secret", default=None, help="Vaultwarden API client_secret")
+    fetch_key.add_argument("--vw-organization-id", default=None, help="Organization UUID (falls back to DB config VW_ORGANIZATION_ID)")
+    fetch_key.add_argument("--no-verify-ssl", action="store_true", default=False, help="Disable SSL certificate verification")
+    fetch_key.set_defaults(func=cmd_fetch_key)
 
     migrate = sub.add_parser("migrate", help="Migrate SQLite credentials to Vaultwarden")
     migrate.add_argument("--db-path", default=str(DEFAULT_DB_PATH), help="Path to data.db")

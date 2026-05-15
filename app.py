@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import sqlite3
@@ -9,11 +10,137 @@ from urllib.parse import quote_plus
 
 from flask import Flask, jsonify, request
 import requests
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hmac as _crypto_hmac
+from cryptography.hazmat.primitives import padding as _sym_padding
+from cryptography.hazmat.primitives.asymmetric import padding as _asym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.serialization import load_der_private_key
 
 
 DB_PATH = Path(__file__).with_name("data.db")
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Bitwarden client-side encryption helpers
+# ---------------------------------------------------------------------------
+
+def _bw_encrypt(plaintext: str, enc_key: bytes, mac_key: bytes) -> str:
+    """Encrypt a UTF-8 string to Bitwarden EncString format '2.iv|ct|mac'."""
+    iv = os.urandom(16)
+    padder = _sym_padding.PKCS7(128).padder()
+    padded = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    encryptor = cipher.encryptor()
+    ct = encryptor.update(padded) + encryptor.finalize()
+    h = _crypto_hmac.HMAC(mac_key, hashes.SHA256())
+    h.update(iv + ct)
+    mac = h.finalize()
+    return (
+        f"2.{base64.b64encode(iv).decode()}"
+        f"|{base64.b64encode(ct).decode()}"
+        f"|{base64.b64encode(mac).decode()}"
+    )
+
+
+def _bw_decrypt_enc_string(enc_string: str, enc_key: bytes, mac_key: bytes) -> bytes:
+    if not enc_string.startswith("2."):
+        raise ValueError(f"Unsupported EncString type: {enc_string[:3]!r}")
+    _, rest = enc_string.split(".", 1)
+    parts = rest.split("|")
+    iv = base64.b64decode(parts[0])
+    ct = base64.b64decode(parts[1])
+    mac_bytes = base64.b64decode(parts[2])
+    h = _crypto_hmac.HMAC(mac_key, hashes.SHA256())
+    h.update(iv + ct)
+    try:
+        h.verify(mac_bytes)
+    except InvalidSignature as exc:
+        raise ValueError("MAC verification failed") from exc
+    cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
+    decryptor = cipher.decryptor()
+    padded = decryptor.update(ct) + decryptor.finalize()
+    unpadder = _sym_padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+def _bw_derive_keys(email: str, password: str, kdf_type: int, kdf_iterations: int,
+                    kdf_memory: Optional[int] = None, kdf_parallelism: Optional[int] = None) -> tuple[bytes, bytes]:
+    """Derive (enc_key, mac_key) stretched from master password."""
+    salt = email.strip().lower().encode("utf-8")
+    secret = password.encode("utf-8")
+    if kdf_type == 0:
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=kdf_iterations)
+        master_key = kdf.derive(secret)
+    elif kdf_type == 1:
+        from argon2.low_level import Type, hash_secret_raw  # type: ignore[import]
+        mem_kb = (kdf_memory or 64) * 1024
+        master_key = hash_secret_raw(
+            secret=secret, salt=salt,
+            time_cost=kdf_iterations or 3, memory_cost=mem_kb,
+            parallelism=kdf_parallelism or 4, hash_len=32, type=Type.ID,
+        )
+    else:
+        raise ValueError(f"Unsupported KDF type {kdf_type}")
+    enc_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"enc").derive(master_key)
+    mac_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"mac").derive(master_key)
+    return enc_key, mac_key
+
+
+def _bw_load_sym_keys(
+    session: requests.Session,
+    base_url: str,
+    master_password: str,
+    org_id: Optional[str] = None,
+) -> tuple[bytes, bytes]:
+    """Fetch /api/sync and derive (enc_key, mac_key) for org or personal vault."""
+    resp = session.get(f"{base_url}/api/sync?excludeDomains=true", timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Sync failed ({resp.status_code})")
+    data = resp.json()
+    profile = data.get("profile") or data.get("Profile") or data
+    email = profile.get("email") or profile.get("Email") or ""
+    kdf_type = int(profile.get("kdf") if profile.get("kdf") is not None else (profile.get("Kdf") or 0))
+    kdf_iter = int(profile.get("kdfIterations") or profile.get("KdfIterations") or 600_000)
+    kdf_mem = profile.get("kdfMemory") or profile.get("KdfMemory")
+    kdf_par = profile.get("kdfParallelism") or profile.get("KdfParallelism")
+    stretched_enc, stretched_mac = _bw_derive_keys(email, master_password, kdf_type, kdf_iter, kdf_mem, kdf_par)
+    profile_key_str = profile.get("key") or profile.get("Key") or ""
+    user_sym_bytes = _bw_decrypt_enc_string(profile_key_str, stretched_enc, stretched_mac)
+    user_enc_key, user_mac_key = user_sym_bytes[:32], user_sym_bytes[32:64]
+    if not org_id:
+        return user_enc_key, user_mac_key
+    priv_key_str = profile.get("privateKey") or profile.get("PrivateKey") or ""
+    priv_key_der = _bw_decrypt_enc_string(priv_key_str, user_enc_key, user_mac_key)
+    rsa_key = load_der_private_key(priv_key_der, password=None)
+    orgs_list = profile.get("organizations") or profile.get("Organizations") or []
+    org_entry = next(
+        (o for o in orgs_list if (o.get("id") or o.get("Id") or "").lower() == org_id.lower()),
+        None,
+    )
+    if org_entry is None:
+        raise RuntimeError(f"Organization {org_id} not found in sync profile")
+    org_key_str = org_entry.get("key") or org_entry.get("Key") or ""
+    if org_key_str.startswith("4."):
+        rsa_ct = base64.b64decode(org_key_str[2:])
+        org_sym = rsa_key.decrypt(
+            rsa_ct,
+            _asym_padding.OAEP(
+                mgf=_asym_padding.MGF1(algorithm=hashes.SHA1()),
+                algorithm=hashes.SHA1(),
+                label=None,
+            ),
+        )
+        return org_sym[:32], org_sym[32:64]
+    if org_key_str.startswith("2."):
+        org_sym = _bw_decrypt_enc_string(org_key_str, user_enc_key, user_mac_key)
+        return org_sym[:32], org_sym[32:64]
+    raise ValueError(f"Unsupported org key EncString type: {org_key_str[:3]!r}")
 
 
 def _fetch_bearer_token(base_url: str, client_id: str, client_secret: str, verify_ssl: bool = True) -> str:
@@ -212,7 +339,15 @@ class VaultwardenMapping:
         mapped_type = self.type_map.get(cred_type, cred_type)
         return mapped_client, mapped_type
 
-    def make_cipher_payload(self, client: str, secret: str, cred_type: str, organization_id: Optional[str], collection_id: Optional[str] = None) -> dict[str, Any]:
+    def make_cipher_payload(
+        self,
+        client: str,
+        secret: str,
+        cred_type: str,
+        organization_id: Optional[str],
+        collection_id: Optional[str] = None,
+        sym_keys: Optional[tuple[bytes, bytes]] = None,
+    ) -> dict[str, Any]:
         mapped_client, mapped_type = self.map_values(client, cred_type)
         values = {
             "client": mapped_client,
@@ -220,14 +355,20 @@ class VaultwardenMapping:
             "raw_client": client,
             "raw_type": cred_type,
         }
+
+        def _enc(s: str) -> str:
+            if sym_keys:
+                return _bw_encrypt(s, sym_keys[0], sym_keys[1])
+            return s
+
         payload: dict[str, Any] = {
             "type": 1,
-            "name": self.name_template.format(**values),
-            "notes": self.notes_template.format(**values),
+            "name": _enc(self.name_template.format(**values)),
+            "notes": _enc(self.notes_template.format(**values)),
             "favorite": False,
             "login": {
-                "username": self.username_template.format(**values),
-                "password": secret,
+                "username": _enc(self.username_template.format(**values)),
+                "password": _enc(secret),
                 "totp": None,
                 "uris": [],
             },
@@ -277,6 +418,18 @@ class VaultwardenBackend(CredentialBackend):
         self.session.verify = verify_ssl
         if not verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # Load pre-derived encryption key so new incoming credentials are stored
+        # with proper Bitwarden encryption. The master password is never stored;
+        # VW_SYM_KEY is the base64-encoded 64-byte derived key saved by `migrate`.
+        self.sym_keys: Optional[tuple[bytes, bytes]] = None
+        sym_key_b64 = cfg("VW_SYM_KEY")
+        if sym_key_b64:
+            try:
+                raw = base64.b64decode(sym_key_b64)
+                self.sym_keys = (raw[:32], raw[32:64])
+            except Exception as exc:
+                raise RuntimeError(f"VW_SYM_KEY is invalid: {exc}") from exc
 
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
         url = f"{self.base_url}{path}"
@@ -333,7 +486,9 @@ class VaultwardenBackend(CredentialBackend):
         raise RuntimeError("Vaultwarden create response did not include cipher id")
 
     def save(self, client: str, secret: str, cred_type: str) -> None:
-        payload = self.mapping.make_cipher_payload(client, secret, cred_type, self.organization_id, self.collection_id)
+        payload = self.mapping.make_cipher_payload(
+            client, secret, cred_type, self.organization_id, self.collection_id, self.sym_keys
+        )
 
         self._delete_cipher_if_known(client, cred_type)
         if self.collection_id:
