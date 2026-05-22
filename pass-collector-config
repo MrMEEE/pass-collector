@@ -695,6 +695,46 @@ def _prompt_select_collection(collections: list[dict[str, str]]) -> str:
     return collections[int(selected) - 1]["id"]
 
 
+_B32_RE = re.compile(r'^[A-Z2-7]+=*$')
+_B64_RE = re.compile(r'^[A-Za-z0-9+/\-_]+=*$')
+
+
+def _maybe_decode_secret(secret: str) -> str:
+    """Detect and decode base32 or base64 encoded secrets.
+
+    Tries base32 first (more restrictive character set), then standard base64
+    and URL-safe base64.  Returns the decoded UTF-8 string when the decoded
+    result is printable text; otherwise returns the original value unchanged.
+    """
+    if len(secret) < 8:
+        return secret
+
+    # --- base32 ---
+    if _B32_RE.match(secret):
+        padded = secret + "=" * ((8 - len(secret) % 8) % 8)
+        try:
+            decoded = base64.b32decode(padded)
+            text = decoded.decode("utf-8")
+            if text.isprintable() and text != secret:
+                return text
+        except Exception:
+            pass
+
+    # --- base64 / base64url ---
+    if _B64_RE.match(secret):
+        normalized = secret.replace("-", "+").replace("_", "/")
+        padded = normalized + "=" * ((4 - len(normalized) % 4) % 4)
+        try:
+            decoded = base64.b64decode(padded)
+            text = decoded.decode("utf-8")
+            if text.isprintable() and text != secret:
+                return text
+        except Exception:
+            pass
+
+    return secret
+
+
 def cmd_migrate(args: argparse.Namespace) -> int:
     db_path = Path(args.db_path)
     _ensure_vw_map_table(db_path)
@@ -933,7 +973,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     for entry in entries:
         client = entry["client"]
         cred_type = entry["type"]
-        secret = entry["secret"]
+        secret = _maybe_decode_secret(entry["secret"])
 
         try:
             old_id = _get_mapped_item_id(db_path, client, cred_type)
