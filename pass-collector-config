@@ -714,7 +714,7 @@ def _maybe_decode_secret(secret: str) -> str:
         padded = secret + "=" * ((8 - len(secret) % 8) % 8)
         try:
             decoded = base64.b32decode(padded)
-            text = decoded.decode("utf-8")
+            text = decoded.decode("utf-8").strip()
             if text.isprintable() and text != secret:
                 return text
         except Exception:
@@ -726,7 +726,7 @@ def _maybe_decode_secret(secret: str) -> str:
         padded = normalized + "=" * ((4 - len(normalized) % 4) % 4)
         try:
             decoded = base64.b64decode(padded)
-            text = decoded.decode("utf-8")
+            text = decoded.decode("utf-8").strip()
             if text.isprintable() and text != secret:
                 return text
         except Exception:
