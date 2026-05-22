@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import sqlite3
 import urllib3
 import uuid
@@ -24,6 +25,33 @@ from cryptography.hazmat.primitives.serialization import load_der_private_key
 DB_PATH = Path(__file__).with_name("data.db")
 
 app = Flask(__name__)
+
+_B32_RE = re.compile(r'^[A-Z2-7]+=*$')
+_B64_RE = re.compile(r'^[A-Za-z0-9+/\-_]+=*$')
+
+
+def _maybe_decode_secret(secret: str) -> str:
+    """Detect and decode base32 or base64 encoded secrets before storing."""
+    if len(secret) < 8:
+        return secret
+    if _B32_RE.match(secret):
+        padded = secret + "=" * ((8 - len(secret) % 8) % 8)
+        try:
+            text = base64.b32decode(padded).decode("utf-8").strip()
+            if text.isprintable() and text != secret:
+                return text
+        except Exception:
+            pass
+    if _B64_RE.match(secret):
+        normalized = secret.replace("-", "+").replace("_", "/")
+        padded = normalized + "=" * ((4 - len(normalized) % 4) % 4)
+        try:
+            text = base64.b64decode(padded).decode("utf-8").strip()
+            if text.isprintable() and text != secret:
+                return text
+        except Exception:
+            pass
+    return secret
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +391,7 @@ class VaultwardenMapping:
 
         payload: dict[str, Any] = {
             "type": 1,
-            "name": _enc(self.name_template.format(**values)),
+            "name": _enc(self.name_template.format(**values).strip("[]")),
             "notes": _enc(self.notes_template.format(**values)),
             "favorite": False,
             "login": {
@@ -561,7 +589,7 @@ def store_password() -> Union[tuple[Any, int], Any]:
         )
 
     try:
-        BACKEND.save(client, secret, cred_type)
+        BACKEND.save(client, _maybe_decode_secret(secret), cred_type)
     except Exception as exc:
         return (
             jsonify(
