@@ -390,7 +390,7 @@ def _build_payload(
 
     payload: dict[str, Any] = {
         "type": 1,
-        "name": _enc(name_template.format(**values)),
+        "name": _enc(name_template.format(**values).strip("[]")),
         "notes": _enc(notes_template.format(**values)),
         "favorite": False,
         "login": {
