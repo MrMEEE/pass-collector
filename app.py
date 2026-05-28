@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import urllib3
 import uuid
 from pathlib import Path
@@ -423,14 +424,22 @@ class VaultwardenBackend(CredentialBackend):
             raise RuntimeError("VW_API_URL is required when BACKEND=vaultwarden")
 
         verify_ssl_raw = (cfg("VW_VERIFY_SSL", "true") or "true").lower()
-        verify_ssl = verify_ssl_raw not in ("false", "0", "no")
+        self.verify_ssl = verify_ssl_raw not in ("false", "0", "no")
+
+        # How often (seconds) to re-fetch the bearer token. Default 30 minutes.
+        refresh_raw = cfg("VW_TOKEN_REFRESH_INTERVAL", "1800") or "1800"
+        try:
+            self._token_refresh_interval: float = float(refresh_raw)
+        except ValueError:
+            self._token_refresh_interval = 1800.0
+
+        self._client_id: Optional[str] = cfg("VW_CLIENT_ID")
+        self._client_secret: Optional[str] = cfg("VW_CLIENT_SECRET")
 
         token = cfg("VW_ACCESS_TOKEN")
         if not token:
-            client_id = cfg("VW_CLIENT_ID")
-            client_secret = cfg("VW_CLIENT_SECRET")
-            if client_id and client_secret:
-                token = _fetch_bearer_token(self.base_url, client_id, client_secret, verify_ssl)
+            if self._client_id and self._client_secret:
+                token = _fetch_bearer_token(self.base_url, self._client_id, self._client_secret, self.verify_ssl)
         if not token:
             raise RuntimeError(
                 "VW_ACCESS_TOKEN or both VW_CLIENT_ID and VW_CLIENT_SECRET are required when BACKEND=vaultwarden"
@@ -443,9 +452,12 @@ class VaultwardenBackend(CredentialBackend):
                 "Content-Type": "application/json",
             }
         )
-        self.session.verify = verify_ssl
-        if not verify_ssl:
+        self.session.verify = self.verify_ssl
+        if not self.verify_ssl:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # Timestamp of last successful token fetch (monotonic seconds).
+        self._token_fetched_at: float = time.monotonic()
 
         # Load pre-derived encryption key so new incoming credentials are stored
         # with proper Bitwarden encryption. The master password is never stored;
@@ -459,7 +471,20 @@ class VaultwardenBackend(CredentialBackend):
             except Exception as exc:
                 raise RuntimeError(f"VW_SYM_KEY is invalid: {exc}") from exc
 
+    def _maybe_refresh_token(self) -> None:
+        """Re-fetch the bearer token if the refresh interval has elapsed.
+        Only runs when client_id + client_secret are available (not static tokens).
+        """
+        if not (self._client_id and self._client_secret):
+            return
+        if time.monotonic() - self._token_fetched_at < self._token_refresh_interval:
+            return
+        new_token = _fetch_bearer_token(self.base_url, self._client_id, self._client_secret, self.verify_ssl)
+        self.session.headers["Authorization"] = f"Bearer {new_token}"
+        self._token_fetched_at = time.monotonic()
+
     def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
+        self._maybe_refresh_token()
         url = f"{self.base_url}{path}"
         try:
             response = self.session.request(method=method, url=url, json=payload, timeout=15)
