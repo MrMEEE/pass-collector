@@ -471,23 +471,34 @@ class VaultwardenBackend(CredentialBackend):
             except Exception as exc:
                 raise RuntimeError(f"VW_SYM_KEY is invalid: {exc}") from exc
 
-    def _maybe_refresh_token(self) -> None:
-        """Re-fetch the bearer token if the refresh interval has elapsed.
+    def _can_refresh_token(self) -> bool:
+        return bool(self._client_id and self._client_secret)
+
+    def _maybe_refresh_token(self, force: bool = False) -> None:
+        """Re-fetch the bearer token if the refresh interval has elapsed (or when forced).
         Only runs when client_id + client_secret are available (not static tokens).
         """
-        if not (self._client_id and self._client_secret):
+        if not self._can_refresh_token():
             return
-        if time.monotonic() - self._token_fetched_at < self._token_refresh_interval:
+        if not force and time.monotonic() - self._token_fetched_at < self._token_refresh_interval:
             return
         new_token = _fetch_bearer_token(self.base_url, self._client_id, self._client_secret, self.verify_ssl)
         self.session.headers["Authorization"] = f"Bearer {new_token}"
         self._token_fetched_at = time.monotonic()
 
-    def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
+    def _send(self, method: str, url: str, payload: Optional[dict[str, Any]] = None) -> requests.Response:
+        """Send an authenticated request, renewing the token on expiry and retrying once on 401."""
         self._maybe_refresh_token()
+        response = self.session.request(method=method, url=url, json=payload, timeout=15)
+        if response.status_code == 401 and self._can_refresh_token():
+            self._maybe_refresh_token(force=True)
+            response = self.session.request(method=method, url=url, json=payload, timeout=15)
+        return response
+
+    def _request(self, method: str, path: str, payload: Optional[dict[str, Any]] = None) -> Any:
         url = f"{self.base_url}{path}"
         try:
-            response = self.session.request(method=method, url=url, json=payload, timeout=15)
+            response = self._send(method, url, payload)
         except requests.RequestException as exc:
             raise RuntimeError(f"vaultwarden API request failed: {exc}") from exc
 
@@ -511,7 +522,7 @@ class VaultwardenBackend(CredentialBackend):
 
         url = f"{self.base_url}/api/ciphers/{quote_plus(existing_id)}"
         try:
-            response = self.session.delete(url=url, timeout=15)
+            response = self._send("DELETE", url)
         except requests.RequestException as exc:
             raise RuntimeError(f"vaultwarden API request failed during delete: {exc}") from exc
 

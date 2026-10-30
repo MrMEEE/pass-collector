@@ -53,7 +53,7 @@ Example using a static bearer token:
 	--vw-collection-id "..."
 ```
 
-Example using client credentials (token is fetched from `/identity/connect/token` at startup):
+Example using client credentials (token is fetched from `/identity/connect/token` at startup, re-fetched every `VW_TOKEN_REFRESH_INTERVAL` seconds (default 1800), and renewed immediately if Vaultwarden returns 401):
 
 ```bash
 ./pass-collector-config config \
